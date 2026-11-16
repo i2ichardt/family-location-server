@@ -537,12 +537,21 @@ static int g_roster_content = 0;
 
 static std::wstring stay_line(const Member& m) {
     if (!m.hasLoc) return L"No location yet";
-    long long start = m.arrived > 0 ? m.arrived : m.ts;
     long long now = static_cast<long long>(std::time(nullptr));
+    if (m.traveling) {
+        int mph = static_cast<int>(m.speed * 2.23694 + 0.5);
+        if (mph < 1) mph = 1;
+        long long start = m.departed > 0 ? m.departed : m.ts;
+        long long mins = now > start ? (now - start) / 60 : 0;
+        std::wstring from = m.departedFrom.empty() ? L"this spot" : widen(m.departedFrom);
+        std::wstring ago = mins < 1 ? L"just now" : (std::to_wstring(mins) + L" mins ago");
+        return L"Traveling at " + std::to_wstring(mph) + L" MPH · Departed from " + from + L" - " + ago;
+    }
+    long long start = m.arrived > 0 ? m.arrived : m.ts;
     long long mins = now > start ? (now - start) / 60 : 0;
     std::wstring where = m.area.empty() ? L"this spot" : widen(m.area);
-    std::wstring how = mins < 1 ? L"Just arrived" : (L"Here " + std::to_wstring(mins) + (mins == 1 ? L" min" : L" min"));
-    return how + L" · " + where;
+    std::wstring ago = mins < 1 ? L"just now" : (std::to_wstring(mins) + L" mins ago");
+    return L"Arrived to " + where + L" - " + ago;
 }
 
 static void remove_member(const std::string& group, const std::string& user) {

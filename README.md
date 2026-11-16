@@ -6,10 +6,10 @@ The phone app is [location-test](https://github.com/i2ichardt/location-test).
 
 ## Download
 
-The compiled program is on the [v1.2 release](https://github.com/i2ichardt/family-location-server/releases/tag/v1.2).
+The compiled program is on the [v1.3 release](https://github.com/i2ichardt/family-location-server/releases/tag/v1.3).
 
-- [FamilyLocationServer.exe](https://github.com/i2ichardt/family-location-server/releases/download/v1.2/FamilyLocationServer.exe)
-- [FamilyLocationServer-windows.zip](https://github.com/i2ichardt/family-location-server/releases/download/v1.2/FamilyLocationServer-windows.zip) — program, how-to, and firewall script
+- [FamilyLocationServer.exe](https://github.com/i2ichardt/family-location-server/releases/download/v1.3/FamilyLocationServer.exe)
+- [FamilyLocationServer-windows.zip](https://github.com/i2ichardt/family-location-server/releases/download/v1.3/FamilyLocationServer-windows.zip) — program, how-to, and firewall script
 
 ## On the PC
 

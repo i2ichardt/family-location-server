@@ -58,6 +58,10 @@ struct Member {
     double anchorLat = 0;
     double anchorLon = 0;
     std::string area;
+    bool traveling = false;
+    double speed = 0;
+    long long departed = 0;
+    std::string departedFrom;
 };
 
 struct Place {
@@ -166,6 +170,10 @@ static void save_locked() {
             {"anchorLat", m.anchorLat},
             {"anchorLon", m.anchorLon},
             {"area", m.area},
+            {"traveling", m.traveling},
+            {"speed", m.speed},
+            {"departed", m.departed},
+            {"departedFrom", m.departedFrom},
         });
     }
     json places = json::array();
@@ -233,6 +241,10 @@ static void load_store() {
             m.anchorLat = j.value("anchorLat", m.lat);
             m.anchorLon = j.value("anchorLon", m.lon);
             m.area = j.value("area", "");
+            m.traveling = j.value("traveling", false);
+            m.speed = j.value("speed", 0.0);
+            m.departed = j.value("departed", 0LL);
+            m.departedFrom = j.value("departedFrom", "");
             g_members[key_of(m.groupId, m.userId)] = m;
         }
     }
@@ -299,14 +311,34 @@ static void setup_routes(httplib::Server& server) {
                          std::chrono::system_clock::now().time_since_epoch())
                          .count();
             }
+            bool hasSpeed = j.contains("speed") && j["speed"].is_number();
+            double speed = hasSpeed ? j["speed"].get<double>() : 0;
             {
                 std::lock_guard<std::mutex> lock(g_mu);
                 Member& m = ensure_member(groupId, userId);
-                bool moved = !m.hasLoc || m.arrived <= 0 || haversine_m(m.anchorLat, m.anchorLon, lat, lon) > 120.0;
-                if (moved) {
-                    m.arrived = ts;
-                    m.anchorLat = lat;
-                    m.anchorLon = lon;
+                if (hasSpeed) {
+                    bool moving = m.traveling ? speed >= 0.6 : speed >= 1.2;
+                    if (moving) {
+                        if (!m.traveling) {
+                            m.traveling = true;
+                            m.departed = ts;
+                            m.departedFrom = m.area.empty() ? "this spot" : m.area;
+                        }
+                    } else if (m.traveling || m.arrived <= 0 || haversine_m(m.anchorLat, m.anchorLon, lat, lon) > 120.0) {
+                        m.traveling = false;
+                        m.arrived = ts;
+                        m.anchorLat = lat;
+                        m.anchorLon = lon;
+                    }
+                    m.speed = speed;
+                } else {
+                    bool moved = !m.hasLoc || m.arrived <= 0 || haversine_m(m.anchorLat, m.anchorLon, lat, lon) > 120.0;
+                    if (moved) {
+                        m.arrived = ts;
+                        m.anchorLat = lat;
+                        m.anchorLon = lon;
+                    }
+                    m.traveling = false;
                 }
                 m.lat = lat;
                 m.lon = lon;
@@ -442,6 +474,10 @@ static void setup_routes(httplib::Server& server) {
                     one["ts"] = m.ts;
                     one["arrived"] = m.arrived > 0 ? m.arrived : m.ts;
                     one["area"] = m.area;
+                    one["traveling"] = m.traveling;
+                    one["speed"] = m.speed;
+                    one["departed"] = m.departed;
+                    one["departedFrom"] = m.departedFrom;
                 }
                 members.push_back(one);
             }
