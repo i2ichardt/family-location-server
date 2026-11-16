@@ -6,9 +6,9 @@ The phone app is [location-test](https://github.com/i2ichardt/location-test).
 
 ## Download
 
-[Download FamilyLocationServer.exe](https://github.com/i2ichardt/family-location-server/releases/latest/download/FamilyLocationServer.exe)
+[Download FamilyLocationServer.exe](https://github.com/i2ichardt/family-location-server/raw/main/FamilyLocationServer.exe)
 
-The same file is also in this repository if you want it from the file list.
+On a phone, tap that link, then the download arrow. On the PC, open the link and save the file.
 
 ## Run it
 
