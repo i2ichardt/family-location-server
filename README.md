@@ -1,6 +1,6 @@
-# Family Location Server
+# Family location server
 
-Windows program for the location check. The phone sends one pin. This program keeps the latest pin for each person and hands it back. It listens on port **8000**. Nothing is saved after you close the window.
+Windows program for the family map. Phones send a pin, a name, a phone number, and a photo. This program keeps the latest pin for each person, plus the places the group shares. It listens on port **8000** on every address of this PC, so the same window answers on home Wi-Fi and on Tailscale.
 
 The phone app is [location-test](https://github.com/i2ichardt/location-test).
 
@@ -8,76 +8,55 @@ The phone app is [location-test](https://github.com/i2ichardt/location-test).
 
 [Download FamilyLocationServer.exe](https://github.com/i2ichardt/family-location-server/raw/main/FamilyLocationServer.exe)
 
-On a phone, tap that link, then the download arrow. On the PC, open the link and save the file.
-
 ## Run it
 
-1. Put `FamilyLocationServer.exe` in a folder you can find. `allow-firewall.ps1` can sit next to it.
-2. Double-click the program. Leave the window open.
-3. It should say **Server listening on port 8000**.
-4. Windows may say it protected your PC, because the file is unsigned. Choose **More info**, then **Run anyway**.
-5. If a firewall prompt appears, allow it on **Private** networks only.
+1. Save `FamilyLocationServer.exe` in a folder. `allow-firewall.ps1` can sit next to it.
+2. Double-click the program.
+3. The window shows people and shared places. The status line should say it is listening on port 8000.
+4. If Windows says it protected your PC, choose **More info**, then **Run anyway**. Allow the firewall prompt on **Private** networks.
+5. Closing the window hides it in the system tray. The server keeps running. Double-click the tray icon to show it again. Right-click that icon and choose **Exit** to stop it.
 
-Do not close the window. Closing it stops the server. Pins are forgotten when it stops.
+Profiles, photos, pins, and places are saved in a `data` folder next to the program. **Open saved data** opens that folder. Hiding to the tray does not erase them.
 
-## Address to type on the phone
+## Addresses the phone should save
 
-The phone needs the address of **this PC**, not the phone.
+Find both on this PC and type them into the phone's Settings. Leave the phone on **Auto**. Auto tries the home address first. If the phone is not on that Wi-Fi, the home address does not answer and the app uses Tailscale.
 
-**Same Wi-Fi**
-
-1. On the PC, open Command Prompt and run `ipconfig`.
-2. Under the Wi-Fi adapter, copy the **IPv4 Address**. It looks like `192.168.1.20`.
-3. On the phone, set Server URL to `http://192.168.1.20:8000` (use your number).
-
-**Away from home, through Tailscale**
-
-1. Install Tailscale on the PC and on the phone. Sign both into the same account.
-2. On the PC, open Tailscale and copy the address that starts with `100.`.
-3. On the phone, set Server URL to `http://100.x.x.x:8000` (use your number).
-4. Tailscale has to say Connected on both devices.
-
-Use `http://`, not `https://`. There is no certificate on this test server.
-
-## Check that it works
-
-On the phone, open Location Test and tap **Check server**. The status should show `200` and `OK`.
-
-Then tap **Send location**, then **Fetch location**. Fetch should show the same user, group, latitude, and longitude you just sent.
-
-From the PC you can also open a browser to `http://127.0.0.1:8000/health`. It should say `OK`.
-
-## If the phone cannot connect
-
-- The black window is still open and still says it is listening.
-- The URL starts with `http://`, has the PC address, and ends with `:8000`. No extra slash or path.
-- Phone and PC are on the same Wi-Fi, or both Tailscale apps are Connected.
-- You did not type the phone's own address.
-- Windows Firewall is blocking it. Right-click `allow-firewall.ps1`, choose **Run with PowerShell**, and approve the administrator prompt. That opens TCP port 8000 on private networks only.
-
-## What it stores
-
-One latest pin per user and group, in memory only.
-
-| Call | What it does |
+| Where the phone is | Address |
 |---|---|
-| `GET /health` | Returns `OK` if the program is running. |
-| `POST /send` | Body is JSON: `{"userId","groupId","lat","lon"}`. Replaces that person's pin. |
-| `GET /fetch?userId=Alice&groupId=Fam1` | Returns that person's latest pin. |
+| Same Wi-Fi | `http://192.168.x.x:8000` from `ipconfig` |
+| Anywhere else | `http://100.x.x.x:8000` from `tailscale ip -4` |
 
-`userId` and `groupId` must match on send and fetch. `Alice` and `alice` are different. The sample in the phone app is user `Alice`, group `Fam1`.
+Use `http://`, not `https://`. A MagicDNS name works too: `http://PCNAME.tailnet.ts.net:8000`.
+
+Every phone in the family uses the same group name.
+
+## If a phone cannot connect
+
+- The tray icon is still there, or the window is open.
+- The URL starts with `http://` and ends with `:8000`.
+- Both Tailscale apps say Connected when you are testing the Tailscale address.
+- Right-click `allow-firewall.ps1`, choose **Run with PowerShell**, and approve the administrator prompt. That opens TCP port 8000 on private networks only.
+
+## What the phones send
+
+| Call | What it stores |
+|---|---|
+| `POST /profile` | Name, phone number, and the profile photo |
+| `POST /send` | Latest latitude and longitude for that person |
+| `GET /group?groupId=Fam1` | Everyone in the group, plus shared places |
+| `POST /place` | A place the whole group can see |
+| `GET /health` | `OK` if the program is running |
+
+`GET /fetch` still returns one person's latest pin.
 
 ## Keep it private
 
-There is no password and no HTTPS. Anyone who can reach port 8000 can send and read pins.
-
-- Do not forward port 8000 on your router.
-- Do not put this on a public IP.
-- Use your home Wi-Fi, or Tailscale. Tailscale is the right choice when the phone is not on the same Wi-Fi.
+There is no password and no HTTPS. Tailscale encrypts the path between the phone and this PC. Anyone on your tailnet who can open port 8000 can read the pins. Do not forward port 8000 on your router.
 
 ## Rebuild
 
-The source is `server.cpp`. Headers in `include/` are cpp-httplib and nlohmann/json (both MIT). You need a C++17 compiler.
+`server.cpp` is C++17. Headers in `include/` are cpp-httplib and nlohmann/json, both MIT.
 
 ```
 cmake -S . -B build

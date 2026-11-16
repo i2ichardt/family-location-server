@@ -11,5 +11,7 @@ find_package(Threads REQUIRED)
 target_link_libraries(FamilyLocationServer PRIVATE Threads::Threads)
 
 if (WIN32)
-    target_link_libraries(FamilyLocationServer PRIVATE ws2_32 crypt32)
+    target_compile_definitions(FamilyLocationServer PRIVATE _WIN32_WINNT=0x0A00 WINVER=0x0A00)
+    target_link_libraries(FamilyLocationServer PRIVATE ws2_32 crypt32 comctl32 shell32 user32 gdi32)
+    set_target_properties(FamilyLocationServer PROPERTIES WIN32_EXECUTABLE TRUE)
 endif()

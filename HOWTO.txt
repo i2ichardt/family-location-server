@@ -1,27 +1,28 @@
-Family Location Server
-=====================
+Family location server
+======================
 
-1. Double-click FamilyLocationServer.exe
-   Leave the window open. It should say: Server listening on port 8000
+1. Double-click FamilyLocationServer.exe.
+   The window lists people and shared places.
+   It listens on port 8000 for your home network and for Tailscale.
    Windows may say it protected your PC because this file is unsigned.
    Choose More info, then Run anyway.
    If a firewall prompt appears, allow it on Private networks.
 
-2. If nothing can connect, right-click allow-firewall.ps1 and run it
+2. Closing the window hides it in the system tray. The server keeps running.
+   Double-click the tray icon to open it again.
+   Right-click the tray icon and choose Exit to stop it.
+
+3. If nothing can connect, right-click allow-firewall.ps1 and run it
    with PowerShell as Administrator.
 
-3. On the phone app, set the server URL to one of:
-   - Same Wi-Fi:  http://<this PC's LAN address>:8000
-   - Tailscale:   http://<this PC's 100.x.x.x address>:8000
+4. On each phone, open Family, then Settings.
+   Home Wi-Fi address:  http://<this PC's LAN address>:8000
+   Tailscale address:   http://<this PC's 100.x address>:8000
+   Leave the choice on Auto. Auto tries home first, then Tailscale.
+   Set the same group name on every phone, then Save.
 
-4. Endpoints
-   GET  /health
-   POST /send    JSON {"userId","groupId","lat","lon"}
-   GET  /fetch?userId=Alice&groupId=Fam1
+5. Profiles, photos, latest pins, and shared places are saved in a
+   data folder next to this program. Open saved data shows that folder.
+   They stay there after you hide the window. Exit does not delete them.
 
-The source folder is the same program, if you want to rebuild it.
-cpp-httplib and nlohmann/json in source/include are third-party MIT headers.
-
-This is a test server. No password, no HTTPS. Keep it on your tailnet only.
-Do not forward port 8000 to the public internet.
-
+There is no password and no HTTPS. Do not forward port 8000 to the internet.
