@@ -25,6 +25,7 @@
 
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <ctime>
@@ -64,6 +65,9 @@ struct Place {
 };
 
 static std::mutex g_mu;
+static std::mutex g_wait_mu;
+static std::condition_variable g_cv;
+static long long g_rev = 1;
 static std::map<std::string, Member> g_members;
 static std::map<std::string, Place> g_places;
 static httplib::Server* g_server = nullptr;
@@ -171,6 +175,15 @@ static void save_locked() {
     if (ec) fs::copy_file(tmp, dest, fs::copy_options::overwrite_existing, ec);
 }
 
+static void commit_locked() {
+    save_locked();
+    {
+        std::lock_guard<std::mutex> lock(g_wait_mu);
+        g_rev++;
+    }
+    g_cv.notify_all();
+}
+
 static void load_store() {
     fs::path dest = g_root / "family.json";
     if (!fs::exists(dest)) return;
@@ -269,7 +282,7 @@ static void setup_routes(httplib::Server& server) {
                 m.lon = lon;
                 m.ts = ts;
                 m.hasLoc = true;
-                save_locked();
+                commit_locked();
             }
             json resp;
             resp["status"] = "saved";
@@ -354,7 +367,7 @@ static void setup_routes(httplib::Server& server) {
                     m.hasImage = true;
                     m.imageTs = imageTs;
                 }
-                save_locked();
+                commit_locked();
             }
             json resp;
             resp["status"] = "saved";
@@ -407,6 +420,10 @@ static void setup_routes(httplib::Server& server) {
         resp["groupId"] = groupId;
         resp["members"] = members;
         resp["places"] = places;
+        {
+            std::lock_guard<std::mutex> lock(g_wait_mu);
+            resp["rev"] = g_rev;
+        }
         res.set_content(resp.dump(), "application/json");
     });
 
@@ -456,7 +473,7 @@ static void setup_routes(httplib::Server& server) {
                 p.lon = lon;
                 p.radius = radius;
                 g_places[key_of(groupId, id)] = p;
-                save_locked();
+                commit_locked();
             }
             json resp;
             resp["status"] = "saved";
@@ -478,7 +495,7 @@ static void setup_routes(httplib::Server& server) {
             {
                 std::lock_guard<std::mutex> lock(g_mu);
                 g_places.erase(key_of(groupId, id));
-                save_locked();
+                commit_locked();
             }
             json resp;
             resp["status"] = "deleted";
@@ -486,6 +503,61 @@ static void setup_routes(httplib::Server& server) {
         } catch (const std::exception& e) {
             json_error(res, 400, std::string("Invalid JSON: ") + e.what());
         }
+    });
+
+    server.Post("/group/delete", [](const httplib::Request& req, httplib::Response& res) {
+        try {
+            auto j = json::parse(req.body);
+            std::string groupId = j.value("groupId", "");
+            if (groupId.empty()) {
+                json_error(res, 400, "Missing groupId");
+                return;
+            }
+            std::vector<std::string> users;
+            {
+                std::lock_guard<std::mutex> lock(g_mu);
+                for (auto it = g_members.begin(); it != g_members.end();) {
+                    if (it->second.groupId == groupId) {
+                        users.push_back(it->second.userId);
+                        it = g_members.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+                for (auto it = g_places.begin(); it != g_places.end();) {
+                    if (it->second.groupId == groupId) it = g_places.erase(it);
+                    else ++it;
+                }
+                commit_locked();
+            }
+            for (const std::string& user : users) {
+                std::error_code ec;
+                fs::remove(avatar_path(groupId, user), ec);
+            }
+            json resp;
+            resp["status"] = "deleted";
+            res.set_content(resp.dump(), "application/json");
+        } catch (const std::exception& e) {
+            json_error(res, 400, std::string("Invalid JSON: ") + e.what());
+        }
+    });
+
+    server.Get("/wait", [](const httplib::Request& req, httplib::Response& res) {
+        long long since = 0;
+        try {
+            since = std::stoll(req.get_param_value("rev"));
+        } catch (...) {
+            since = 0;
+        }
+        long long now = 0;
+        {
+            std::unique_lock<std::mutex> lock(g_wait_mu);
+            g_cv.wait_for(lock, std::chrono::seconds(20), [&] { return g_rev != since; });
+            now = g_rev;
+        }
+        json resp;
+        resp["rev"] = now;
+        res.set_content(resp.dump(), "application/json");
     });
 }
 
@@ -573,6 +645,8 @@ static void add_item(HWND list, int row, const std::vector<std::wstring>& cells)
     }
 }
 
+#include "map_win.inc"
+
 static void fill_lists() {
     std::vector<Member> members;
     std::vector<Place> places;
@@ -581,6 +655,8 @@ static void fill_lists() {
         for (const auto& kv : g_members) members.push_back(kv.second);
         for (const auto& kv : g_places) places.push_back(kv.second);
     }
+    g_row_people = members;
+    g_row_places = places;
     SendMessageW(g_people, LVM_DELETEALLITEMS, 0, 0);
     int row = 0;
     for (const Member& m : members) {
@@ -609,6 +685,8 @@ static void fill_lists() {
         wcsncpy_s(g_nid.szTip, tip.c_str(), _TRUNCATE);
         Shell_NotifyIconW(NIM_MODIFY, &g_nid);
     }
+    refresh_address_labels();
+    if (g_map) InvalidateRect(g_map, nullptr, FALSE);
 }
 
 static void add_tray(HWND hwnd) {
@@ -669,6 +747,14 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_really_quit = true;
             DestroyWindow(hwnd);
         }
+        if (LOWORD(wp) == 120) save_tail_from_edit();
+        if (LOWORD(wp) == 121) {
+            toggle_satellite();
+            set_text(reinterpret_cast<HWND>(lp) ? GetDlgItem(hwnd, 121) : GetDlgItem(hwnd, 121), g_satellite ? L"Street map" : L"Satellite");
+        }
+        if (LOWORD(wp) == 122) delete_person();
+        if (LOWORD(wp) == 123) delete_group();
+        if (LOWORD(wp) == 124) delete_place();
         return 0;
     case WM_TRAY:
         if (lp == WM_LBUTTONDBLCLK || lp == WM_LBUTTONUP) show_again(hwnd);
@@ -734,30 +820,49 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int show) {
     RegisterClassW(&wc);
 
     g_hwnd = CreateWindowExW(0, wc.lpszClassName, L"Family location server",
-        WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 920, 640,
+        WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 1200, 820,
         nullptr, nullptr, inst, nullptr);
 
-    make_label(g_hwnd, L"People", 16, 8, 200, 18, 0);
-    g_people = make_list(g_hwnd, ID_LIST_PEOPLE, 16, 28, 880, 250);
-    add_column(g_people, 0, L"Group", 110);
-    add_column(g_people, 1, L"Name", 180);
-    add_column(g_people, 2, L"Phone", 140);
-    add_column(g_people, 3, L"Location", 240);
-    add_column(g_people, 4, L"Updated", 120);
+    Gdiplus::GdiplusStartupInput gdip_in;
+    Gdiplus::GdiplusStartup(&g_gdip, &gdip_in, nullptr);
+    load_tail_setting();
 
-    make_label(g_hwnd, L"Shared places", 16, 286, 200, 18, 0);
-    g_placeList = make_list(g_hwnd, ID_LIST_PLACES, 16, 306, 880, 180);
-    add_column(g_placeList, 0, L"Group", 110);
-    add_column(g_placeList, 1, L"Place", 220);
-    add_column(g_placeList, 2, L"Lat", 140);
-    add_column(g_placeList, 3, L"Lon", 140);
-    add_column(g_placeList, 4, L"Radius", 100);
+    g_homeLabel = make_label(g_hwnd, L"Home", 16, 8, 1160, 20, 0);
+    g_tailLive = make_label(g_hwnd, L"Tailscale", 16, 30, 1160, 20, 0);
+    make_label(g_hwnd, L"Saved Tailscale address", 16, 56, 180, 22, 0);
+    g_tailEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+        200, 52, 600, 26, g_hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(130)), nullptr, nullptr);
+    SendMessageW(g_tailEdit, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
+    make_button(g_hwnd, L"Save address", 812, 50, 120, 28, 120);
+    make_button(g_hwnd, L"Satellite", 944, 50, 110, 28, 121);
 
-    g_statusLabel = make_label(g_hwnd, L"Starting", 16, 496, 700, 20, ID_STATUS);
-    make_button(g_hwnd, L"Open saved data", 730, 492, 160, 28, ID_OPEN);
+    create_map(g_hwnd);
+
+    make_label(g_hwnd, L"People", 730, 92, 200, 18, 0);
+    g_people = make_list(g_hwnd, ID_LIST_PEOPLE, 730, 112, 440, 210);
+    add_column(g_people, 0, L"Group", 80);
+    add_column(g_people, 1, L"Name", 120);
+    add_column(g_people, 2, L"Phone", 90);
+    add_column(g_people, 3, L"Location", 80);
+    add_column(g_people, 4, L"Updated", 60);
+
+    make_label(g_hwnd, L"Shared places", 730, 330, 200, 18, 0);
+    g_placeList = make_list(g_hwnd, ID_LIST_PLACES, 730, 350, 440, 160);
+    add_column(g_placeList, 0, L"Group", 80);
+    add_column(g_placeList, 1, L"Place", 140);
+    add_column(g_placeList, 2, L"Lat", 70);
+    add_column(g_placeList, 3, L"Lon", 70);
+    add_column(g_placeList, 4, L"Radius", 60);
+
+    make_button(g_hwnd, L"Delete person", 730, 520, 140, 28, 122);
+    make_button(g_hwnd, L"Delete group", 880, 520, 140, 28, 123);
+    make_button(g_hwnd, L"Delete place", 1030, 520, 140, 28, 124);
+    make_button(g_hwnd, L"Open saved data", 730, 556, 150, 28, ID_OPEN);
+
+    g_statusLabel = make_label(g_hwnd, L"Starting", 16, 610, 1140, 20, ID_STATUS);
     make_label(g_hwnd,
-        L"No password and no HTTPS. The phone uses http://<this PC>:8000 on your Wi-Fi, or the Tailscale address when it is away. Do not forward port 8000 to the internet. Closing this window hides it in the tray. Right-click the tray icon and choose Exit to stop.",
-        16, 528, 880, 48, ID_NOTE);
+        L"Both addresses use port 8000. Phones on your Wi-Fi use Home. Phones away use the saved Tailscale address. Closing this window hides it in the tray. Right-click the tray icon and choose Exit to stop. No password and no HTTPS.",
+        16, 636, 1140, 40, ID_NOTE);
 
     g_server = new httplib::Server();
     setup_routes(*g_server);

@@ -21,8 +21,15 @@ Family location server
    Leave the choice on Auto. Auto tries home first, then Tailscale.
    Set the same group name on every phone, then Save.
 
-5. Profiles, photos, latest pins, and shared places are saved in a
-   data folder next to this program. Open saved data shows that folder.
-   They stay there after you hide the window. Exit does not delete them.
+The window shows two addresses, both with port 8000:
+
+- Home is this PC's LAN address. Phones on the same Wi-Fi use it.
+- Tailscale is filled in when Tailscale is connected. You can edit the saved Tailscale address and click Save address. Phones that are away use that one.
+
+The map on the left shows everyone who has sent a pin. Satellite switches the picture to aerial photos. Drag to move the map. The wheel zooms.
+
+Delete person, Delete group, and Delete place remove test data. Deleting a group removes its people, photos, and places.
+
+Closing the window hides it in the tray. Right-click the tray icon and choose Exit to stop.
 
 There is no password and no HTTPS. Do not forward port 8000 to the internet.

@@ -8,6 +8,12 @@ The phone app is [location-test](https://github.com/i2ichardt/location-test).
 
 [Download FamilyLocationServer.exe](https://github.com/i2ichardt/family-location-server/raw/main/FamilyLocationServer.exe)
 
+## On the PC
+
+The window lists **Home** as `http://<LAN address>:8000` and **Tailscale** as `http://<100.x address>:8000`. Edit the saved Tailscale address if you want the phones to use a MagicDNS name, then click **Save address**.
+
+The map shows the people who have sent a pin. **Satellite** switches to aerial photos. **Delete person**, **Delete group**, and **Delete place** clear test data. Deleting a group removes its people, photos, and places.
+
 ## Run it
 
 1. Save `FamilyLocationServer.exe` in a folder. `allow-firewall.ps1` can sit next to it.
