@@ -12,7 +12,7 @@ The phone app is [location-test](https://github.com/i2ichardt/location-test).
 
 The window lists **Home** as `http://<LAN address>:8000` and **Tailscale** as `http://<100.x address>:8000`. Edit the saved Tailscale address if you want the phones to use a MagicDNS name, then click **Save address**.
 
-The map shows the people who have sent a pin. **Satellite** switches to aerial photos. **Delete person**, **Delete group**, and **Delete place** clear test data. Deleting a group removes its people, photos, and places.
+The map shows the people who have sent a pin. **Satellite** switches to aerial photos. **Pause updates** freezes the map and the list. Profile photos are the pins. People and places are listed by group, with edit and delete on each row.
 
 ## Run it
 
@@ -20,9 +20,9 @@ The map shows the people who have sent a pin. **Satellite** switches to aerial p
 2. Double-click the program.
 3. The window shows people and shared places. The status line should say it is listening on port 8000.
 4. If Windows says it protected your PC, choose **More info**, then **Run anyway**. Allow the firewall prompt on **Private** networks.
-5. Closing the window hides it in the system tray. The server keeps running. Double-click the tray icon to show it again. Right-click that icon and choose **Exit** to stop it.
+5. Minimize the window to keep the server running. It stays on the taskbar. Closing the window stops the program and ends the process. There is no system-tray icon.
 
-Profiles, photos, pins, and places are saved in a `data` folder next to the program. **Open saved data** opens that folder. Hiding to the tray does not erase them.
+Profiles, photos, pins, and places are saved in a `data` folder next to the program. **Open saved data** opens that folder. Closing the window does not erase them.
 
 ## Addresses the phone should save
 
@@ -39,7 +39,7 @@ Every phone in the family uses the same group name.
 
 ## If a phone cannot connect
 
-- The tray icon is still there, or the window is open.
+- The window is open, or the program is minimized on the taskbar. Closing it stops the server.
 - The URL starts with `http://` and ends with `:8000`.
 - Both Tailscale apps say Connected when you are testing the Tailscale address.
 - Right-click `allow-firewall.ps1`, choose **Run with PowerShell**, and approve the administrator prompt. That opens TCP port 8000 on private networks only.

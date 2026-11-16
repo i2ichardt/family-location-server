@@ -23,6 +23,7 @@
 #include "httplib.h"
 #include "json.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -53,6 +54,10 @@ struct Member {
     bool hasLoc = false;
     bool hasImage = false;
     long long imageTs = 0;
+    long long arrived = 0;
+    double anchorLat = 0;
+    double anchorLon = 0;
+    std::string area;
 };
 
 struct Place {
@@ -67,6 +72,7 @@ struct Place {
 static std::mutex g_mu;
 static std::mutex g_wait_mu;
 static std::condition_variable g_cv;
+static std::atomic<bool> g_stopping{false};
 static long long g_rev = 1;
 static std::map<std::string, Member> g_members;
 static std::map<std::string, Place> g_places;
@@ -80,6 +86,16 @@ static std::string key_of(const std::string& group, const std::string& id) {
 
 static bool valid_coord(double lat, double lon) {
     return lat >= -90.0 && lat <= 90.0 && lon >= -180.0 && lon <= 180.0;
+}
+
+static double haversine_m(double lat1, double lon1, double lat2, double lon2) {
+    const double r = 6371000.0;
+    double p1 = lat1 * 3.141592653589793 / 180.0;
+    double p2 = lat2 * 3.141592653589793 / 180.0;
+    double dp = (lat2 - lat1) * 3.141592653589793 / 180.0;
+    double dl = (lon2 - lon1) * 3.141592653589793 / 180.0;
+    double a = std::sin(dp / 2) * std::sin(dp / 2) + std::cos(p1) * std::cos(p2) * std::sin(dl / 2) * std::sin(dl / 2);
+    return 2 * r * std::atan2(std::sqrt(a), std::sqrt(1 - a));
 }
 
 static std::string clip(const std::string& s, size_t n) {
@@ -146,6 +162,10 @@ static void save_locked() {
             {"hasLoc", m.hasLoc},
             {"hasImage", m.hasImage},
             {"imageTs", m.imageTs},
+            {"arrived", m.arrived},
+            {"anchorLat", m.anchorLat},
+            {"anchorLon", m.anchorLon},
+            {"area", m.area},
         });
     }
     json places = json::array();
@@ -209,6 +229,10 @@ static void load_store() {
             m.hasLoc = j.value("hasLoc", false);
             m.hasImage = j.value("hasImage", false);
             m.imageTs = j.value("imageTs", 0LL);
+            m.arrived = j.value("arrived", 0LL);
+            m.anchorLat = j.value("anchorLat", m.lat);
+            m.anchorLon = j.value("anchorLon", m.lon);
+            m.area = j.value("area", "");
             g_members[key_of(m.groupId, m.userId)] = m;
         }
     }
@@ -278,10 +302,25 @@ static void setup_routes(httplib::Server& server) {
             {
                 std::lock_guard<std::mutex> lock(g_mu);
                 Member& m = ensure_member(groupId, userId);
+                bool moved = !m.hasLoc || m.arrived <= 0 || haversine_m(m.anchorLat, m.anchorLon, lat, lon) > 120.0;
+                if (moved) {
+                    m.arrived = ts;
+                    m.anchorLat = lat;
+                    m.anchorLon = lon;
+                }
                 m.lat = lat;
                 m.lon = lon;
                 m.ts = ts;
                 m.hasLoc = true;
+                m.area.clear();
+                for (const auto& kv : g_places) {
+                    const Place& p = kv.second;
+                    if (p.groupId != groupId) continue;
+                    if (haversine_m(lat, lon, p.lat, p.lon) <= p.radius) {
+                        m.area = p.name;
+                        break;
+                    }
+                }
                 commit_locked();
             }
             json resp;
@@ -401,6 +440,8 @@ static void setup_routes(httplib::Server& server) {
                     one["lat"] = m.lat;
                     one["lon"] = m.lon;
                     one["ts"] = m.ts;
+                    one["arrived"] = m.arrived > 0 ? m.arrived : m.ts;
+                    one["area"] = m.area;
                 }
                 members.push_back(one);
             }
@@ -552,7 +593,7 @@ static void setup_routes(httplib::Server& server) {
         long long now = 0;
         {
             std::unique_lock<std::mutex> lock(g_wait_mu);
-            g_cv.wait_for(lock, std::chrono::seconds(20), [&] { return g_rev != since; });
+            g_cv.wait_for(lock, std::chrono::seconds(20), [&] { return g_stopping.load() || g_rev != since; });
             now = g_rev;
         }
         json resp;
@@ -583,9 +624,6 @@ static void configure_data_dir() {
 
 #ifdef _WIN32
 
-static const UINT WM_TRAY = WM_APP + 1;
-static const int ID_TRAY_OPEN = 1;
-static const int ID_TRAY_EXIT = 2;
 static const int ID_LIST_PEOPLE = 100;
 static const int ID_LIST_PLACES = 101;
 static const int ID_STATUS = 102;
@@ -595,9 +633,6 @@ static HWND g_hwnd = nullptr;
 static HWND g_people = nullptr;
 static HWND g_placeList = nullptr;
 static HWND g_statusLabel = nullptr;
-static NOTIFYICONDATAW g_nid{};
-static bool g_tray = false;
-static bool g_really_quit = false;
 static HFONT g_font = nullptr;
 
 static std::wstring widen(const std::string& s) {
@@ -648,6 +683,11 @@ static void add_item(HWND list, int row, const std::vector<std::wstring>& cells)
 #include "map_win.inc"
 
 static void fill_lists() {
+    refresh_address_labels();
+    if (!g_live) {
+        set_text(g_statusLabel, widen(g_status) + L"    live updates paused");
+        return;
+    }
     std::vector<Member> members;
     std::vector<Place> places;
     {
@@ -655,67 +695,32 @@ static void fill_lists() {
         for (const auto& kv : g_members) members.push_back(kv.second);
         for (const auto& kv : g_places) places.push_back(kv.second);
     }
+    std::string sig;
+    for (const Member& m : members) {
+        sig += m.groupId + m.userId + m.name + std::to_string(m.lat) + std::to_string(m.lon) + std::to_string(m.imageTs) + m.area;
+    }
+    for (const Place& p : places) sig += p.id + p.name + std::to_string(p.lat);
+    bool changed = sig != g_list_sig;
+    g_list_sig = sig;
     g_row_people = members;
     g_row_places = places;
-    SendMessageW(g_people, LVM_DELETEALLITEMS, 0, 0);
-    int row = 0;
-    for (const Member& m : members) {
-        std::string where = m.hasLoc ? (std::to_string(m.lat).substr(0, 9) + ", " + std::to_string(m.lon).substr(0, 10)) : "no pin yet";
-        std::string who = m.name.empty() ? m.userId : m.name;
-        add_item(g_people, row++, {widen(m.groupId), widen(who), widen(m.phone), widen(where), widen(stamp(m.ts))});
-    }
-    SendMessageW(g_placeList, LVM_DELETEALLITEMS, 0, 0);
-    row = 0;
-    for (const Place& p : places) {
-        add_item(g_placeList, row++, {
-            widen(p.groupId),
-            widen(p.name),
-            widen(std::to_string(p.lat).substr(0, 9)),
-            widen(std::to_string(p.lon).substr(0, 10)),
-            widen(std::to_string(static_cast<int>(p.radius)) + " m"),
-        });
-    }
     int nPeople = static_cast<int>(members.size());
     int nPlaces = static_cast<int>(places.size());
-    std::wstring status = widen(g_status) + L"    " + std::to_wstring(nPeople) + L" people    " + std::to_wstring(nPlaces) + L" places";
-    set_text(g_statusLabel, status);
-    if (g_tray) {
-        std::wstring tip = L"Family location  " + std::to_wstring(nPeople) + L" people";
-        if (tip.size() > 120) tip.resize(120);
-        wcsncpy_s(g_nid.szTip, tip.c_str(), _TRUNCATE);
-        Shell_NotifyIconW(NIM_MODIFY, &g_nid);
+    set_text(g_statusLabel, widen(g_status) + L"    " + std::to_wstring(nPeople) + L" people    " + std::to_wstring(nPlaces) + L" places");
+    if (g_roster) InvalidateRect(g_roster, nullptr, FALSE);
+    if (changed && g_map) InvalidateRect(g_map, nullptr, FALSE);
+}
+
+static void stop_everything() {
+    g_stopping = true;
+    g_tile_quit = true;
+    g_job_cv.notify_all();
+    g_cv.notify_all();
+    if (g_server) {
+        httplib::Server* server = g_server;
+        g_server = nullptr;
+        server->stop();
     }
-    refresh_address_labels();
-    if (g_map) InvalidateRect(g_map, nullptr, FALSE);
-}
-
-static void add_tray(HWND hwnd) {
-    g_nid = {};
-    g_nid.cbSize = sizeof(g_nid);
-    g_nid.hWnd = hwnd;
-    g_nid.uID = 1;
-    g_nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
-    g_nid.uCallbackMessage = WM_TRAY;
-    g_nid.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
-    wcscpy_s(g_nid.szTip, L"Family location server");
-    Shell_NotifyIconW(NIM_ADD, &g_nid);
-    g_tray = true;
-}
-
-static void remove_tray() {
-    if (!g_tray) return;
-    Shell_NotifyIconW(NIM_DELETE, &g_nid);
-    g_tray = false;
-}
-
-static void hide_to_tray(HWND hwnd) {
-    ShowWindow(hwnd, SW_HIDE);
-}
-
-static void show_again(HWND hwnd) {
-    ShowWindow(hwnd, SW_SHOW);
-    ShowWindow(hwnd, SW_RESTORE);
-    SetForegroundWindow(hwnd);
 }
 
 static void open_data() {
@@ -728,54 +733,42 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CREATE:
         return 0;
     case WM_SIZE:
-        if (wp == SIZE_MINIMIZED) {
-            hide_to_tray(hwnd);
+        // Minimize uses the normal taskbar button. Do not hide the window.
+        return DefWindowProcW(hwnd, msg, wp, lp);
+    case WM_SYSCOMMAND:
+        if ((wp & 0xFFF0) == SC_CLOSE) {
+            DestroyWindow(hwnd);
             return 0;
         }
-        return 0;
+        return DefWindowProcW(hwnd, msg, wp, lp);
     case WM_CLOSE:
-        if (!g_really_quit) {
-            hide_to_tray(hwnd);
-            return 0;
-        }
         DestroyWindow(hwnd);
         return 0;
     case WM_COMMAND:
         if (LOWORD(wp) == ID_OPEN) open_data();
-        if (LOWORD(wp) == ID_TRAY_OPEN) show_again(hwnd);
-        if (LOWORD(wp) == ID_TRAY_EXIT) {
-            g_really_quit = true;
-            DestroyWindow(hwnd);
-        }
         if (LOWORD(wp) == 120) save_tail_from_edit();
         if (LOWORD(wp) == 121) {
             toggle_satellite();
-            set_text(reinterpret_cast<HWND>(lp) ? GetDlgItem(hwnd, 121) : GetDlgItem(hwnd, 121), g_satellite ? L"Street map" : L"Satellite");
+            HWND button = GetDlgItem(hwnd, 121);
+            if (button) set_text(button, g_satellite ? L"Street map" : L"Satellite");
         }
-        if (LOWORD(wp) == 122) delete_person();
-        if (LOWORD(wp) == 123) delete_group();
-        if (LOWORD(wp) == 124) delete_place();
-        return 0;
-    case WM_TRAY:
-        if (lp == WM_LBUTTONDBLCLK || lp == WM_LBUTTONUP) show_again(hwnd);
-        if (lp == WM_RBUTTONUP) {
-            POINT pt;
-            GetCursorPos(&pt);
-            HMENU menu = CreatePopupMenu();
-            AppendMenuW(menu, MF_STRING, ID_TRAY_OPEN, L"Open");
-            AppendMenuW(menu, MF_STRING, ID_TRAY_EXIT, L"Exit");
-            SetForegroundWindow(hwnd);
-            TrackPopupMenu(menu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, nullptr);
-            DestroyMenu(menu);
+        if (LOWORD(wp) == 125) {
+            g_live = !g_live;
+            HWND button = GetDlgItem(hwnd, 125);
+            if (button) set_text(button, g_live ? L"Pause updates" : L"Resume updates");
+            if (g_live) g_list_sig.clear();
+            fill_lists();
         }
         return 0;
     case WM_TIMER:
         fill_lists();
         return 0;
     case WM_DESTROY:
-        remove_tray();
-        if (g_server) g_server->stop();
+        KillTimer(hwnd, 1);
+        stop_everything();
         PostQuitMessage(0);
+        // Detached listen and map threads would keep the process in Task Manager.
+        ExitProcess(0);
         return 0;
     default:
         return DefWindowProcW(hwnd, msg, wp, lp);
@@ -833,36 +826,18 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int show) {
     g_tailEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
         200, 52, 600, 26, g_hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(130)), nullptr, nullptr);
     SendMessageW(g_tailEdit, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
-    make_button(g_hwnd, L"Save address", 812, 50, 120, 28, 120);
-    make_button(g_hwnd, L"Satellite", 944, 50, 110, 28, 121);
+    make_button(g_hwnd, L"Save address", 640, 50, 120, 28, 120);
+    make_button(g_hwnd, L"Satellite", 770, 50, 110, 28, 121);
+    make_button(g_hwnd, L"Pause updates", 890, 50, 140, 28, 125);
+    make_button(g_hwnd, L"Open saved data", 1040, 50, 130, 28, ID_OPEN);
 
     create_map(g_hwnd);
-
-    make_label(g_hwnd, L"People", 730, 92, 200, 18, 0);
-    g_people = make_list(g_hwnd, ID_LIST_PEOPLE, 730, 112, 440, 210);
-    add_column(g_people, 0, L"Group", 80);
-    add_column(g_people, 1, L"Name", 120);
-    add_column(g_people, 2, L"Phone", 90);
-    add_column(g_people, 3, L"Location", 80);
-    add_column(g_people, 4, L"Updated", 60);
-
-    make_label(g_hwnd, L"Shared places", 730, 330, 200, 18, 0);
-    g_placeList = make_list(g_hwnd, ID_LIST_PLACES, 730, 350, 440, 160);
-    add_column(g_placeList, 0, L"Group", 80);
-    add_column(g_placeList, 1, L"Place", 140);
-    add_column(g_placeList, 2, L"Lat", 70);
-    add_column(g_placeList, 3, L"Lon", 70);
-    add_column(g_placeList, 4, L"Radius", 60);
-
-    make_button(g_hwnd, L"Delete person", 730, 520, 140, 28, 122);
-    make_button(g_hwnd, L"Delete group", 880, 520, 140, 28, 123);
-    make_button(g_hwnd, L"Delete place", 1030, 520, 140, 28, 124);
-    make_button(g_hwnd, L"Open saved data", 730, 556, 150, 28, ID_OPEN);
+    create_roster(g_hwnd);
 
     g_statusLabel = make_label(g_hwnd, L"Starting", 16, 610, 1140, 20, ID_STATUS);
     make_label(g_hwnd,
-        L"Both addresses use port 8000. Phones on your Wi-Fi use Home. Phones away use the saved Tailscale address. Closing this window hides it in the tray. Right-click the tray icon and choose Exit to stop. No password and no HTTPS.",
-        16, 636, 1140, 40, ID_NOTE);
+        L"Minimize keeps this running on the taskbar. Closing the window stops it. Pause updates freezes the map and the list. No password and no HTTPS.",
+        16, 636, 1140, 36, ID_NOTE);
 
     g_server = new httplib::Server();
     setup_routes(*g_server);
@@ -873,7 +848,6 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int show) {
     }).detach();
     g_status = "Listening on port 8000  (LAN and Tailscale)";
 
-    add_tray(g_hwnd);
     ShowWindow(g_hwnd, show);
     SetTimer(g_hwnd, 1, 1000, nullptr);
     fill_lists();
@@ -883,6 +857,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int show) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
+    stop_everything();
+    ExitProcess(0);
     return 0;
 }
 

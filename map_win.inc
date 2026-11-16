@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstdio>
 #include <ole2.h>
 #ifndef PROPID
@@ -16,6 +17,9 @@ static HWND g_tailEdit = nullptr;
 static HWND g_map = nullptr;
 static std::vector<Member> g_row_people;
 static std::vector<Place> g_row_places;
+static bool g_live = true;
+static std::string g_list_sig;
+static HWND g_roster = nullptr;
 static std::string g_tail_saved;
 static bool g_tail_seeded = false;
 static bool g_satellite = false;
@@ -341,6 +345,29 @@ static void remember_tile(const std::string& key, const std::vector<unsigned cha
     g_map_state.tiles[key] = {stream, bmp};
 }
 
+static std::map<std::string, Gdiplus::Bitmap*> g_faces;
+static std::map<std::string, long long> g_face_stamp;
+
+static Gdiplus::Bitmap* face_bitmap(const Member& m) {
+    if (!m.hasImage) return nullptr;
+    std::string key = m.groupId + ":" + m.userId;
+    auto have = g_face_stamp.find(key);
+    auto bmp = g_faces.find(key);
+    if (have != g_face_stamp.end() && have->second == m.imageTs && bmp != g_faces.end()) return bmp->second;
+    fs::path path = avatar_path(m.groupId, m.userId);
+    if (!fs::exists(path)) return nullptr;
+    std::wstring wpath = path.wstring();
+    auto* loaded = Gdiplus::Bitmap::FromFile(wpath.c_str());
+    if (!loaded || loaded->GetLastStatus() != Gdiplus::Ok) {
+        delete loaded;
+        return nullptr;
+    }
+    if (bmp != g_faces.end() && bmp->second) delete bmp->second;
+    g_faces[key] = loaded;
+    g_face_stamp[key] = m.imageTs;
+    return loaded;
+}
+
 static LRESULT CALLBACK map_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_LBUTTONDOWN:
@@ -385,21 +412,26 @@ static LRESULT CALLBACK map_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
     }
+    case WM_ERASEBKGND:
+        return 1;
     case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC hdc = BeginPaint(hwnd, &ps);
         RECT rc;
         GetClientRect(hwnd, &rc);
-        Gdiplus::Graphics g(hdc);
+        HDC mem = CreateCompatibleDC(hdc);
+        HBITMAP dib = CreateCompatibleBitmap(hdc, rc.right > 0 ? rc.right : 1, rc.bottom > 0 ? rc.bottom : 1);
+        HGDIOBJ oldbmp = SelectObject(mem, dib);
+        Gdiplus::Graphics g(mem);
+        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
         g.Clear(Gdiplus::Color(255, 231, 226, 214));
         if (!g_map_state.moved) {
             double lat = 0, lon = 0;
             int n = 0;
-            std::lock_guard<std::mutex> lock(g_mu);
-            for (const auto& kv : g_members) {
-                if (!kv.second.hasLoc) continue;
-                lat += kv.second.lat;
-                lon += kv.second.lon;
+            for (const Member& m : g_row_people) {
+                if (!m.hasLoc) continue;
+                lat += m.lat;
+                lon += m.lon;
                 n++;
             }
             if (n) {
@@ -433,13 +465,8 @@ static LRESULT CALLBACK map_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 else want_tile(key);
             }
         }
-        std::vector<Member> people;
-        std::vector<Place> places;
-        {
-            std::lock_guard<std::mutex> lock(g_mu);
-            for (const auto& kv : g_members) if (kv.second.hasLoc) people.push_back(kv.second);
-            for (const auto& kv : g_places) places.push_back(kv.second);
-        }
+        std::vector<Member> people = g_row_people;
+        std::vector<Place> places = g_row_places;
         Gdiplus::Font font(L"Segoe UI", 11);
         for (const Place& p : places) {
             double px, py;
@@ -450,16 +477,32 @@ static LRESULT CALLBACK map_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g.FillEllipse(&fill, sx - 7, sy - 7, 14, 14);
         }
         for (const Member& m : people) {
+            if (!m.hasLoc) continue;
             double px, py;
             project_xy(m.lat, m.lon, g_map_state.zoom, px, py);
             int sx = static_cast<int>(px - left);
             int sy = static_cast<int>(py - top);
-            Gdiplus::SolidBrush fill(Gdiplus::Color(255, 200, 16, 46));
+            Gdiplus::Bitmap* face = face_bitmap(m);
+            Gdiplus::GraphicsPath clip;
+            clip.AddEllipse(sx - 16, sy - 16, 32, 32);
+            if (face) {
+                g.SetClip(&clip);
+                g.DrawImage(face, sx - 16, sy - 16, 32, 32);
+                g.ResetClip();
+            } else {
+                Gdiplus::SolidBrush fill(Gdiplus::Color(255, 200, 16, 46));
+                g.FillEllipse(&fill, sx - 16, sy - 16, 32, 32);
+            }
+            Gdiplus::Pen ring(Gdiplus::Color(255, 255, 250, 244), 2);
+            g.DrawEllipse(&ring, sx - 16, sy - 16, 32, 32);
             Gdiplus::SolidBrush ink(Gdiplus::Color(255, 26, 25, 22));
-            g.FillEllipse(&fill, sx - 9, sy - 9, 18, 18);
             std::wstring name = widen(m.name.empty() ? m.userId : m.name);
-            g.DrawString(name.c_str(), -1, &font, Gdiplus::PointF(static_cast<float>(sx + 12), static_cast<float>(sy - 8)), &ink);
+            g.DrawString(name.c_str(), -1, &font, Gdiplus::PointF(static_cast<float>(sx + 20), static_cast<float>(sy - 8)), &ink);
         }
+        BitBlt(hdc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
+        SelectObject(mem, oldbmp);
+        DeleteObject(dib);
+        DeleteDC(mem);
         EndPaint(hwnd, &ps);
         return 0;
     }
@@ -487,3 +530,394 @@ static void toggle_satellite() {
     }
     if (g_map) InvalidateRect(g_map, nullptr, FALSE);
 }
+
+struct RosterHit {
+    RECT r;
+    int action;
+    std::string group;
+    std::string id;
+};
+static std::vector<RosterHit> g_hits;
+static int g_roster_scroll = 0;
+static int g_roster_content = 0;
+
+static std::wstring stay_line(const Member& m) {
+    if (!m.hasLoc) return L"No location yet";
+    long long start = m.arrived > 0 ? m.arrived : m.ts;
+    long long now = static_cast<long long>(std::time(nullptr));
+    long long mins = now > start ? (now - start) / 60 : 0;
+    std::wstring where = m.area.empty() ? L"this spot" : widen(m.area);
+    std::wstring how = mins < 1 ? L"Just arrived" : (L"Here " + std::to_wstring(mins) + (mins == 1 ? L" min" : L" min"));
+    return how + L" · " + where;
+}
+
+static void remove_member(const std::string& group, const std::string& user) {
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        g_members.erase(key_of(group, user));
+        commit_locked();
+    }
+    std::error_code ec;
+    fs::remove(avatar_path(group, user), ec);
+}
+
+static void remove_place_id(const std::string& group, const std::string& id) {
+    std::lock_guard<std::mutex> lock(g_mu);
+    g_places.erase(key_of(group, id));
+    commit_locked();
+}
+
+static void remove_group_id(const std::string& group) {
+    std::vector<std::string> users;
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        for (auto it = g_members.begin(); it != g_members.end();) {
+            if (it->second.groupId == group) {
+                users.push_back(it->second.userId);
+                it = g_members.erase(it);
+            } else ++it;
+        }
+        for (auto it = g_places.begin(); it != g_places.end();) {
+            if (it->second.groupId == group) it = g_places.erase(it);
+            else ++it;
+        }
+        commit_locked();
+    }
+    for (const std::string& user : users) {
+        std::error_code ec;
+        fs::remove(avatar_path(group, user), ec);
+    }
+}
+
+struct PromptState {
+    HWND edit1 = nullptr;
+    HWND edit2 = nullptr;
+    bool ok = false;
+    bool done = false;
+    std::wstring out1;
+    std::wstring out2;
+};
+
+static LRESULT CALLBACK prompt_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    auto* st = reinterpret_cast<PromptState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    switch (msg) {
+    case WM_COMMAND:
+        if (!st) break;
+        if (LOWORD(wp) == 1) {
+            wchar_t a[256];
+            wchar_t b[256];
+            a[0] = 0;
+            b[0] = 0;
+            if (st->edit1) GetWindowTextW(st->edit1, a, 256);
+            if (st->edit2) GetWindowTextW(st->edit2, b, 256);
+            st->out1 = a;
+            st->out2 = b;
+            st->ok = true;
+            st->done = true;
+            DestroyWindow(hwnd);
+        }
+        if (LOWORD(wp) == 2) {
+            st->done = true;
+            DestroyWindow(hwnd);
+        }
+        return 0;
+    case WM_CLOSE:
+        if (st) st->done = true;
+        DestroyWindow(hwnd);
+        return 0;
+    default:
+        return DefWindowProcW(hwnd, msg, wp, lp);
+    }
+    return 0;
+}
+
+static bool ask_fields(HWND owner, const wchar_t* title, const wchar_t* label1, std::wstring& value1, const wchar_t* label2, std::wstring* value2) {
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSW wc{};
+        wc.lpfnWndProc = prompt_proc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.lpszClassName = L"FamilyPrompt";
+        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+        RegisterClassW(&wc);
+        registered = true;
+    }
+    PromptState st;
+    HWND hwnd = CreateWindowExW(WS_EX_DLGMODALFRAME, L"FamilyPrompt", title,
+        WS_POPUP | WS_CAPTION | WS_SYSMENU, CW_USEDEFAULT, CW_USEDEFAULT, 420, value2 ? 230 : 180,
+        owner, nullptr, GetModuleHandleW(nullptr), nullptr);
+    SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&st));
+    CreateWindowExW(0, L"STATIC", label1, WS_CHILD | WS_VISIBLE, 16, 12, 380, 18, hwnd, nullptr, nullptr, nullptr);
+    st.edit1 = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", value1.c_str(), WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 16, 32, 380, 26, hwnd, nullptr, nullptr, nullptr);
+    if (value2) {
+        CreateWindowExW(0, L"STATIC", label2, WS_CHILD | WS_VISIBLE, 16, 66, 380, 18, hwnd, nullptr, nullptr, nullptr);
+        st.edit2 = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", value2->c_str(), WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 16, 86, 380, 26, hwnd, nullptr, nullptr, nullptr);
+    }
+    int by = value2 ? 130 : 74;
+    CreateWindowExW(0, L"BUTTON", L"Save", WS_CHILD | WS_VISIBLE, 200, by, 90, 28, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(1)), nullptr, nullptr);
+    CreateWindowExW(0, L"BUTTON", L"Cancel", WS_CHILD | WS_VISIBLE, 300, by, 90, 28, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(2)), nullptr, nullptr);
+    EnableWindow(owner, FALSE);
+    ShowWindow(hwnd, SW_SHOW);
+    SetForegroundWindow(hwnd);
+    MSG msg;
+    while (!st.done && GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        if (!IsDialogMessageW(hwnd, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+    EnableWindow(owner, TRUE);
+    SetForegroundWindow(owner);
+    if (!st.ok) return false;
+    value1 = st.out1;
+    if (value2) *value2 = st.out2;
+    return true;
+}
+
+static void edit_person_ui(const std::string& group, const std::string& user) {
+    Member m;
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        auto it = g_members.find(key_of(group, user));
+        if (it == g_members.end()) return;
+        m = it->second;
+    }
+    std::wstring name = widen(m.name);
+    std::wstring phone = widen(m.phone);
+    if (!ask_fields(g_hwnd, L"Edit person", L"Name", name, L"Phone", &phone)) return;
+    std::lock_guard<std::mutex> lock(g_mu);
+    auto it = g_members.find(key_of(group, user));
+    if (it == g_members.end()) return;
+    it->second.name = clip(narrow_w(name), 80);
+    it->second.phone = clip(narrow_w(phone), 40);
+    commit_locked();
+}
+
+static void edit_place_ui(const std::string& group, const std::string& id) {
+    Place p;
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        auto it = g_places.find(key_of(group, id));
+        if (it == g_places.end()) return;
+        p = it->second;
+    }
+    std::wstring name = widen(p.name);
+    std::wstring radius = std::to_wstring(static_cast<int>(p.radius));
+    if (!ask_fields(g_hwnd, L"Edit place", L"Place name", name, L"Radius in meters", &radius)) return;
+    int meters = _wtoi(radius.c_str());
+    if (meters < 20) meters = 20;
+    if (meters > 5000) meters = 5000;
+    std::lock_guard<std::mutex> lock(g_mu);
+    auto it = g_places.find(key_of(group, id));
+    if (it == g_places.end()) return;
+    it->second.name = clip(narrow_w(name), 80);
+    it->second.radius = meters;
+    commit_locked();
+}
+
+static void rename_group_ui(const std::string& group) {
+    std::wstring name = widen(group);
+    if (!ask_fields(g_hwnd, L"Rename group", L"Group name", name, nullptr, nullptr)) return;
+    std::string next = clip(narrow_w(name), 64);
+    if (next.empty() || next == group) return;
+    std::vector<std::string> users;
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        std::vector<Member> moved_m;
+        std::vector<Place> moved_p;
+        for (auto it = g_members.begin(); it != g_members.end();) {
+            if (it->second.groupId == group) {
+                users.push_back(it->second.userId);
+                Member m = it->second;
+                m.groupId = next;
+                moved_m.push_back(m);
+                it = g_members.erase(it);
+            } else ++it;
+        }
+        for (auto it = g_places.begin(); it != g_places.end();) {
+            if (it->second.groupId == group) {
+                Place p = it->second;
+                p.groupId = next;
+                moved_p.push_back(p);
+                it = g_places.erase(it);
+            } else ++it;
+        }
+        for (const Member& m : moved_m) g_members[key_of(m.groupId, m.userId)] = m;
+        for (const Place& p : moved_p) g_places[key_of(p.groupId, p.id)] = p;
+        commit_locked();
+    }
+    for (const std::string& user : users) {
+        std::error_code ec;
+        fs::rename(avatar_path(group, user), avatar_path(next, user), ec);
+    }
+}
+
+static RECT hit_rect(int x, int y, int w, int h) {
+    RECT r{x, y, x + w, y + h};
+    return r;
+}
+
+static void paint_button(Gdiplus::Graphics& g, const RECT& r, const wchar_t* text, Gdiplus::Font& font) {
+    Gdiplus::SolidBrush bg(Gdiplus::Color(255, 244, 241, 234));
+    Gdiplus::Pen pen(Gdiplus::Color(255, 210, 204, 194));
+    g.FillRectangle(&bg, static_cast<INT>(r.left), static_cast<INT>(r.top), static_cast<INT>(r.right - r.left), static_cast<INT>(r.bottom - r.top));
+    g.DrawRectangle(&pen, static_cast<INT>(r.left), static_cast<INT>(r.top), static_cast<INT>(r.right - r.left - 1), static_cast<INT>(r.bottom - r.top - 1));
+    Gdiplus::SolidBrush ink(Gdiplus::Color(255, 26, 25, 22));
+    g.DrawString(text, -1, &font, Gdiplus::PointF(static_cast<float>(r.left + 8), static_cast<float>(r.top + 4)), &ink);
+}
+
+static LRESULT CALLBACK roster_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_MOUSEWHEEL: {
+        int delta = GET_WHEEL_DELTA_WPARAM(wp);
+        g_roster_scroll -= delta / 4;
+        if (g_roster_scroll < 0) g_roster_scroll = 0;
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        int max_scroll = g_roster_content - rc.bottom;
+        if (max_scroll < 0) max_scroll = 0;
+        if (g_roster_scroll > max_scroll) g_roster_scroll = max_scroll;
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+    }
+    case WM_LBUTTONUP: {
+        int x = GET_X_LPARAM(lp);
+        int y = GET_Y_LPARAM(lp) + g_roster_scroll;
+        for (const RosterHit& h : g_hits) {
+            if (x >= h.r.left && x < h.r.right && y >= h.r.top && y < h.r.bottom) {
+                if (h.action == 1) rename_group_ui(h.group);
+                if (h.action == 2 && MessageBoxW(g_hwnd, (L"Delete group " + widen(h.group) + L" and everyone in it?").c_str(), L"Family", MB_YESNO | MB_ICONWARNING) == IDYES) remove_group_id(h.group);
+                if (h.action == 3) edit_person_ui(h.group, h.id);
+                if (h.action == 4 && MessageBoxW(g_hwnd, L"Remove this person?", L"Family", MB_YESNO | MB_ICONWARNING) == IDYES) remove_member(h.group, h.id);
+                if (h.action == 5) edit_place_ui(h.group, h.id);
+                if (h.action == 6 && MessageBoxW(g_hwnd, L"Delete this place?", L"Family", MB_YESNO | MB_ICONWARNING) == IDYES) remove_place_id(h.group, h.id);
+                InvalidateRect(hwnd, nullptr, FALSE);
+                break;
+            }
+        }
+        return 0;
+    }
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hwnd, &ps);
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        HDC mem = CreateCompatibleDC(hdc);
+        HBITMAP dib = CreateCompatibleBitmap(hdc, rc.right > 0 ? rc.right : 1, rc.bottom > 0 ? rc.bottom : 1);
+        HGDIOBJ old = SelectObject(mem, dib);
+        Gdiplus::Graphics g(mem);
+        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        g.Clear(Gdiplus::Color(255, 247, 244, 238));
+        g.TranslateTransform(0, static_cast<float>(-g_roster_scroll));
+        Gdiplus::Font title(L"Segoe UI", 15, Gdiplus::FontStyleBold);
+        Gdiplus::Font body(L"Segoe UI", 12);
+        Gdiplus::Font small(L"Segoe UI", 10);
+        Gdiplus::SolidBrush ink(Gdiplus::Color(255, 26, 25, 22));
+        Gdiplus::SolidBrush muted(Gdiplus::Color(255, 92, 88, 79));
+        g_hits.clear();
+        int y = 8;
+        int width = rc.right - 16;
+        std::vector<std::string> groups;
+        for (const Member& m : g_row_people) if (std::find(groups.begin(), groups.end(), m.groupId) == groups.end()) groups.push_back(m.groupId);
+        for (const Place& p : g_row_places) if (std::find(groups.begin(), groups.end(), p.groupId) == groups.end()) groups.push_back(p.groupId);
+        if (groups.empty()) {
+            g.DrawString(L"No one has checked in yet.", -1, &body, Gdiplus::PointF(12, 12), &muted);
+            y = 40;
+        }
+        for (const std::string& group : groups) {
+            g.DrawString(widen(group).c_str(), -1, &title, Gdiplus::PointF(12, static_cast<float>(y)), &ink);
+            RECT rename = hit_rect(width - 150, y, 70, 24);
+            RECT delg = hit_rect(width - 72, y, 70, 24);
+            paint_button(g, rename, L"Rename", small);
+            paint_button(g, delg, L"Delete", small);
+            g_hits.push_back({rename, 1, group, ""});
+            g_hits.push_back({delg, 2, group, ""});
+            y += 36;
+            g.DrawString(L"People", -1, &small, Gdiplus::PointF(12, static_cast<float>(y)), &muted);
+            y += 20;
+            bool any_person = false;
+            for (const Member& m : g_row_people) {
+                if (m.groupId != group) continue;
+                any_person = true;
+                Gdiplus::SolidBrush card(Gdiplus::Color(255, 255, 252, 247));
+                g.FillRectangle(&card, 8, y, width, 64);
+                Gdiplus::Bitmap* face = face_bitmap(m);
+                if (face) {
+                    Gdiplus::GraphicsPath clip;
+                    clip.AddEllipse(16, y + 12, 40, 40);
+                    g.SetClip(&clip);
+                    g.DrawImage(face, 16, y + 12, 40, 40);
+                    g.ResetClip();
+                } else {
+                    Gdiplus::SolidBrush dot(Gdiplus::Color(255, 200, 16, 46));
+                    g.FillEllipse(&dot, 16, y + 12, 40, 40);
+                }
+                std::wstring who = widen(m.name.empty() ? m.userId : m.name);
+                g.DrawString(who.c_str(), -1, &body, Gdiplus::PointF(64, static_cast<float>(y + 8)), &ink);
+                std::wstring sub = stay_line(m);
+                if (!m.phone.empty()) sub += L"  ·  " + widen(m.phone);
+                g.DrawString(sub.c_str(), -1, &small, Gdiplus::PointF(64, static_cast<float>(y + 30)), &muted);
+                RECT edit = hit_rect(width - 132, y + 18, 58, 26);
+                RECT del = hit_rect(width - 68, y + 18, 58, 26);
+                paint_button(g, edit, L"Edit", small);
+                paint_button(g, del, L"Delete", small);
+                g_hits.push_back({edit, 3, group, m.userId});
+                g_hits.push_back({del, 4, group, m.userId});
+                y += 72;
+            }
+            if (!any_person) {
+                g.DrawString(L"No people in this group.", -1, &small, Gdiplus::PointF(16, static_cast<float>(y)), &muted);
+                y += 22;
+            }
+            g.DrawString(L"Places", -1, &small, Gdiplus::PointF(12, static_cast<float>(y)), &muted);
+            y += 20;
+            bool any_place = false;
+            for (const Place& p : g_row_places) {
+                if (p.groupId != group) continue;
+                any_place = true;
+                Gdiplus::SolidBrush card(Gdiplus::Color(255, 255, 252, 247));
+                g.FillRectangle(&card, 8, y, width, 48);
+                g.DrawString(widen(p.name).c_str(), -1, &body, Gdiplus::PointF(16, static_cast<float>(y + 6)), &ink);
+                std::wstring meta = std::to_wstring(static_cast<int>(p.radius)) + L" m";
+                g.DrawString(meta.c_str(), -1, &small, Gdiplus::PointF(16, static_cast<float>(y + 26)), &muted);
+                RECT edit = hit_rect(width - 132, y + 10, 58, 26);
+                RECT del = hit_rect(width - 68, y + 10, 58, 26);
+                paint_button(g, edit, L"Edit", small);
+                paint_button(g, del, L"Delete", small);
+                g_hits.push_back({edit, 5, group, p.id});
+                g_hits.push_back({del, 6, group, p.id});
+                y += 56;
+            }
+            if (!any_place) {
+                g.DrawString(L"No shared places.", -1, &small, Gdiplus::PointF(16, static_cast<float>(y)), &muted);
+                y += 22;
+            }
+            y += 12;
+        }
+        g_roster_content = y + 8;
+        BitBlt(hdc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
+        SelectObject(mem, old);
+        DeleteObject(dib);
+        DeleteDC(mem);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    default:
+        return DefWindowProcW(hwnd, msg, wp, lp);
+    }
+}
+
+static void create_roster(HWND parent) {
+    WNDCLASSW wc{};
+    wc.lpfnWndProc = roster_proc;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = L"FamilyRoster";
+    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    RegisterClassW(&wc);
+    g_roster = CreateWindowExW(0, L"FamilyRoster", L"", WS_CHILD | WS_VISIBLE, 730, 96, 440, 500, parent, nullptr, wc.hInstance, nullptr);
+}
+
+
