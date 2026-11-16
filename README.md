@@ -10,9 +10,9 @@ The phone app is [location-test](https://github.com/i2ichardt/location-test).
 
 ## On the PC
 
-The window lists **Home** as `http://<LAN address>:8000` and **Tailscale** as `http://<100.x address>:8000`. Edit the saved Tailscale address if you want the phones to use a MagicDNS name, then click **Save address**.
+The window lists **Home** as `http://<LAN address>:8000` and **Tailscale** as `http://<100.x address>:8000`. The saved Tailscale address, the one phones use when they are away, is under **File → Settings**.
 
-The map shows the people who have sent a pin. **Satellite** switches to aerial photos. **Pause updates** freezes the map and the list. Profile photos are the pins. People and places are listed by group, with edit and delete on each row.
+The map shows the people who have sent a pin. **View → Satellite** switches to aerial photos. **View → Pause updates** freezes the map and the list. Profile photos are the pins. People and places are listed by group, with edit and delete on each row.
 
 ## Run it
 
@@ -22,7 +22,7 @@ The map shows the people who have sent a pin. **Satellite** switches to aerial p
 4. If Windows says it protected your PC, choose **More info**, then **Run anyway**. Allow the firewall prompt on **Private** networks.
 5. Minimize the window to keep the server running. It stays on the taskbar. Closing the window stops the program and ends the process. There is no system-tray icon.
 
-Profiles, photos, pins, and places are saved in a `data` folder next to the program. **Open saved data** opens that folder. Closing the window does not erase them.
+Profiles, photos, pins, and places are saved in a `data` folder next to the program. **File → Open saved data** opens that folder. Closing the window does not erase them.
 
 ## Addresses the phone should save
 

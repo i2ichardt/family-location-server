@@ -633,6 +633,7 @@ static HWND g_hwnd = nullptr;
 static HWND g_people = nullptr;
 static HWND g_placeList = nullptr;
 static HWND g_statusLabel = nullptr;
+static HWND g_note = nullptr;
 static HFONT g_font = nullptr;
 
 static std::wstring widen(const std::string& s) {
@@ -728,12 +729,124 @@ static void open_data() {
     ShellExecuteW(g_hwnd, L"open", g_root.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 }
 
+struct SettingsState {
+    HWND edit = nullptr;
+    bool ok = false;
+    bool done = false;
+    std::wstring value;
+};
+
+static LRESULT CALLBACK settings_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    auto* st = reinterpret_cast<SettingsState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    switch (msg) {
+    case WM_COMMAND:
+        if (!st) break;
+        if (LOWORD(wp) == 1) {
+            wchar_t buf[512];
+            buf[0] = 0;
+            if (st->edit) GetWindowTextW(st->edit, buf, 512);
+            st->value = buf;
+            st->ok = true;
+            st->done = true;
+            DestroyWindow(hwnd);
+        }
+        if (LOWORD(wp) == 2) {
+            st->done = true;
+            DestroyWindow(hwnd);
+        }
+        return 0;
+    case WM_CLOSE:
+        if (st) st->done = true;
+        DestroyWindow(hwnd);
+        return 0;
+    default:
+        return DefWindowProcW(hwnd, msg, wp, lp);
+    }
+    return 0;
+}
+
+static void open_settings(HWND owner) {
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSW wc{};
+        wc.lpfnWndProc = settings_proc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.lpszClassName = L"FamilySettings";
+        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+        RegisterClassW(&wc);
+        registered = true;
+    }
+    SettingsState st;
+    st.value = widen(g_tail_saved);
+    HWND hwnd = CreateWindowExW(WS_EX_DLGMODALFRAME, L"FamilySettings", L"Settings",
+        WS_POPUP | WS_CAPTION | WS_SYSMENU, CW_USEDEFAULT, CW_USEDEFAULT, 480, 210,
+        owner, nullptr, GetModuleHandleW(nullptr), nullptr);
+    SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&st));
+    HWND title = CreateWindowExW(0, L"STATIC", L"Saved Tailscale address", WS_CHILD | WS_VISIBLE, 16, 14, 440, 18, hwnd, nullptr, nullptr, nullptr);
+    HWND hint = CreateWindowExW(0, L"STATIC", L"Phones away from home use this. Include http:// and :8000.", WS_CHILD | WS_VISIBLE, 16, 36, 440, 18, hwnd, nullptr, nullptr, nullptr);
+    st.edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", st.value.c_str(), WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 16, 62, 440, 26, hwnd, nullptr, nullptr, nullptr);
+    HWND save = CreateWindowExW(0, L"BUTTON", L"Save", WS_CHILD | WS_VISIBLE | WS_TABSTOP, 248, 108, 96, 28, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(1)), nullptr, nullptr);
+    HWND cancel = CreateWindowExW(0, L"BUTTON", L"Cancel", WS_CHILD | WS_VISIBLE | WS_TABSTOP, 356, 108, 96, 28, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(2)), nullptr, nullptr);
+    SendMessageW(title, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
+    SendMessageW(hint, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
+    SendMessageW(st.edit, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
+    SendMessageW(save, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
+    SendMessageW(cancel, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
+    EnableWindow(owner, FALSE);
+    ShowWindow(hwnd, SW_SHOW);
+    SetForegroundWindow(st.edit);
+    MSG msg;
+    while (!st.done && GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        if (!IsDialogMessageW(hwnd, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+    EnableWindow(owner, TRUE);
+    SetForegroundWindow(owner);
+    if (st.ok) save_tail_text(st.value);
+}
+
+static void layout_main(HWND hwnd) {
+    RECT rc{};
+    GetClientRect(hwnd, &rc);
+    int w = rc.right;
+    int h = rc.bottom;
+    if (w < 80 || h < 80) return;
+    const int margin = 16;
+    if (g_homeLabel) MoveWindow(g_homeLabel, margin, 10, w - margin * 2, 22, TRUE);
+    if (g_tailLive) MoveWindow(g_tailLive, margin, 34, w - margin * 2, 22, TRUE);
+    int top = 66;
+    int content = h - top - 56;
+    if (content < 80) content = 80;
+    int rosterW = w / 3;
+    if (rosterW < 280) rosterW = 280;
+    if (rosterW > 460) rosterW = 460;
+    int mapW = w - margin * 3 - rosterW;
+    if (mapW < 180) {
+        mapW = (w - margin * 3) / 2;
+        rosterW = w - margin * 3 - mapW;
+    }
+    if (g_map) MoveWindow(g_map, margin, top, mapW, content, TRUE);
+    if (g_roster) MoveWindow(g_roster, margin + mapW + margin, top, rosterW, content, TRUE);
+    if (g_statusLabel) MoveWindow(g_statusLabel, margin, top + content + 8, w - margin * 2, 18, TRUE);
+    if (g_note) MoveWindow(g_note, margin, top + content + 28, w - margin * 2, 22, TRUE);
+}
+
+static void sync_menu(HWND hwnd) {
+    HMENU bar = GetMenu(hwnd);
+    if (!bar) return;
+    CheckMenuItem(bar, 121, MF_BYCOMMAND | (g_satellite ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(bar, 125, MF_BYCOMMAND | (!g_live ? MF_CHECKED : MF_UNCHECKED));
+}
+
 static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE:
         return 0;
     case WM_SIZE:
-        // Minimize uses the normal taskbar button. Do not hide the window.
+        if (wp != SIZE_MINIMIZED) layout_main(hwnd);
         return DefWindowProcW(hwnd, msg, wp, lp);
     case WM_SYSCOMMAND:
         if ((wp & 0xFFF0) == SC_CLOSE) {
@@ -744,20 +857,22 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CLOSE:
         DestroyWindow(hwnd);
         return 0;
+    case WM_INITMENUPOPUP:
+        sync_menu(hwnd);
+        return 0;
     case WM_COMMAND:
         if (LOWORD(wp) == ID_OPEN) open_data();
-        if (LOWORD(wp) == 120) save_tail_from_edit();
+        if (LOWORD(wp) == 200) open_settings(hwnd);
+        if (LOWORD(wp) == 201) DestroyWindow(hwnd);
         if (LOWORD(wp) == 121) {
             toggle_satellite();
-            HWND button = GetDlgItem(hwnd, 121);
-            if (button) set_text(button, g_satellite ? L"Street map" : L"Satellite");
+            sync_menu(hwnd);
         }
         if (LOWORD(wp) == 125) {
             g_live = !g_live;
-            HWND button = GetDlgItem(hwnd, 125);
-            if (button) set_text(button, g_live ? L"Pause updates" : L"Resume updates");
             if (g_live) g_list_sig.clear();
             fill_lists();
+            sync_menu(hwnd);
         }
         return 0;
     case WM_TIMER:
@@ -767,7 +882,6 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         KillTimer(hwnd, 1);
         stop_everything();
         PostQuitMessage(0);
-        // Detached listen and map threads would keep the process in Task Manager.
         ExitProcess(0);
         return 0;
     default:
@@ -820,24 +934,29 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int show) {
     Gdiplus::GdiplusStartup(&g_gdip, &gdip_in, nullptr);
     load_tail_setting();
 
-    g_homeLabel = make_label(g_hwnd, L"Home", 16, 8, 1160, 20, 0);
-    g_tailLive = make_label(g_hwnd, L"Tailscale", 16, 30, 1160, 20, 0);
-    make_label(g_hwnd, L"Saved Tailscale address", 16, 56, 180, 22, 0);
-    g_tailEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-        200, 52, 600, 26, g_hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(130)), nullptr, nullptr);
-    SendMessageW(g_tailEdit, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
-    make_button(g_hwnd, L"Save address", 640, 50, 120, 28, 120);
-    make_button(g_hwnd, L"Satellite", 770, 50, 110, 28, 121);
-    make_button(g_hwnd, L"Pause updates", 890, 50, 140, 28, 125);
-    make_button(g_hwnd, L"Open saved data", 1040, 50, 130, 28, ID_OPEN);
+    HMENU file = CreatePopupMenu();
+    AppendMenuW(file, MF_STRING, 200, L"Settings...");
+    AppendMenuW(file, MF_STRING, ID_OPEN, L"Open saved data");
+    AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(file, MF_STRING, 201, L"Exit");
+    HMENU view = CreatePopupMenu();
+    AppendMenuW(view, MF_STRING, 121, L"Satellite");
+    AppendMenuW(view, MF_STRING, 125, L"Pause updates");
+    HMENU bar = CreateMenu();
+    AppendMenuW(bar, MF_POPUP, reinterpret_cast<UINT_PTR>(file), L"File");
+    AppendMenuW(bar, MF_POPUP, reinterpret_cast<UINT_PTR>(view), L"View");
+    SetMenu(g_hwnd, bar);
+
+    g_homeLabel = make_label(g_hwnd, L"Home", 16, 8, 400, 20, 0);
+    g_tailLive = make_label(g_hwnd, L"Tailscale", 16, 30, 400, 20, 0);
 
     create_map(g_hwnd);
     create_roster(g_hwnd);
 
-    g_statusLabel = make_label(g_hwnd, L"Starting", 16, 610, 1140, 20, ID_STATUS);
-    make_label(g_hwnd,
-        L"Minimize keeps this running on the taskbar. Closing the window stops it. Pause updates freezes the map and the list. No password and no HTTPS.",
-        16, 636, 1140, 36, ID_NOTE);
+    g_statusLabel = make_label(g_hwnd, L"Starting", 16, 610, 400, 20, ID_STATUS);
+    g_note = make_label(g_hwnd,
+        L"File, Settings holds the saved Tailscale address. Minimize stays on the taskbar. Close stops the program.",
+        16, 636, 400, 22, ID_NOTE);
 
     g_server = new httplib::Server();
     setup_routes(*g_server);

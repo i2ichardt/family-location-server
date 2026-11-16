@@ -13,7 +13,6 @@ typedef ULONG PROPID;
 
 static HWND g_homeLabel = nullptr;
 static HWND g_tailLive = nullptr;
-static HWND g_tailEdit = nullptr;
 static HWND g_map = nullptr;
 static std::vector<Member> g_row_people;
 static std::vector<Place> g_row_places;
@@ -96,7 +95,7 @@ static void refresh_address_labels() {
         }
     }
     std::string tail_text = "Tailscale on this PC  ";
-    if (tail.empty()) tail_text += "not detected. Paste the 100.x address below if Tailscale is connected.";
+    if (tail.empty()) tail_text += "not detected. Set the phone address in File, then Settings.";
     else {
         for (size_t i = 0; i < tail.size(); i++) {
             if (i) tail_text += "    ";
@@ -105,28 +104,23 @@ static void refresh_address_labels() {
     }
     if (g_homeLabel) set_text(g_homeLabel, widen(home_text));
     if (g_tailLive) set_text(g_tailLive, widen(tail_text));
-    if (!g_tail_seeded && g_tailEdit) {
+    if (!g_tail_seeded) {
         g_tail_seeded = true;
-        std::string show = g_tail_saved;
-        if (show.empty() && !tail.empty()) show = "http://" + tail[0] + ":8000";
-        set_text(g_tailEdit, widen(show));
-        if (g_tail_saved.empty() && !show.empty()) {
-            g_tail_saved = show;
+        if (g_tail_saved.empty() && !tail.empty()) {
+            g_tail_saved = "http://" + tail[0] + ":8000";
             save_tail_setting();
         }
     }
 }
 
-static void save_tail_from_edit() {
-    if (!g_tailEdit) return;
-    wchar_t buf[512];
-    GetWindowTextW(g_tailEdit, buf, 512);
-    g_tail_saved = narrow_w(buf);
-    while (!g_tail_saved.empty() && g_tail_saved.back() == '/') g_tail_saved.pop_back();
-    if (!g_tail_saved.empty() && g_tail_saved.rfind("http://", 0) != 0 && g_tail_saved.rfind("https://", 0) != 0) {
+static void save_tail_text(const std::wstring& raw) {
+    g_tail_saved = narrow_w(raw);
+    while (!g_tail_saved.empty() && (g_tail_saved.back() == ' ' || g_tail_saved.back() == '/')) g_tail_saved.pop_back();
+    size_t start = 0;
+    while (start < g_tail_saved.size() && g_tail_saved[start] == ' ') start++;
+    if (start > 0) g_tail_saved.erase(0, start);
+    if (!g_tail_saved.empty() && g_tail_saved.rfind("http://", 0) != 0 && g_tail_saved.rfind("https://", 0) != 0)
         g_tail_saved = "http://" + g_tail_saved;
-        set_text(g_tailEdit, widen(g_tail_saved));
-    }
     save_tail_setting();
 }
 
@@ -518,7 +512,7 @@ static void create_map(HWND parent) {
     wc.lpszClassName = L"FamilyMapView";
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     RegisterClassW(&wc);
-    g_map = CreateWindowExW(WS_EX_CLIENTEDGE, L"FamilyMapView", L"", WS_CHILD | WS_VISIBLE, 16, 96, 700, 500, parent, nullptr, wc.hInstance, nullptr);
+    g_map = CreateWindowExW(WS_EX_CLIENTEDGE, L"FamilyMapView", L"", WS_CHILD | WS_VISIBLE, 0, 0, 10, 10, parent, nullptr, wc.hInstance, nullptr);
     std::thread(tile_worker).detach();
 }
 
@@ -917,7 +911,7 @@ static void create_roster(HWND parent) {
     wc.lpszClassName = L"FamilyRoster";
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     RegisterClassW(&wc);
-    g_roster = CreateWindowExW(0, L"FamilyRoster", L"", WS_CHILD | WS_VISIBLE, 730, 96, 440, 500, parent, nullptr, wc.hInstance, nullptr);
+    g_roster = CreateWindowExW(0, L"FamilyRoster", L"", WS_CHILD | WS_VISIBLE, 0, 0, 10, 10, parent, nullptr, wc.hInstance, nullptr);
 }
 
 
