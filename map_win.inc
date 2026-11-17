@@ -492,10 +492,31 @@ static LRESULT CALLBACK map_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         for (const Place& p : places) {
             double px, py;
             project_xy(p.lat, p.lon, g_map_state.zoom, px, py);
-            int sx = static_cast<int>(px - left);
-            int sy = static_cast<int>(py - top);
-            Gdiplus::SolidBrush fill(Gdiplus::Color(180, 20, 90, 50));
-            g.FillEllipse(&fill, sx - 7, sy - 7, 14, 14);
+            float sx = static_cast<float>(px - left);
+            float sy = static_cast<float>(py - top);
+            double cosLat = std::cos(p.lat * 3.141592653589793 / 180.0);
+            if (cosLat < 0.01) cosLat = 0.01;
+            double metersPerPx = cosLat * 40075016.685578488 / (256.0 * static_cast<double>(1 << g_map_state.zoom));
+            float rad = static_cast<float>(p.radius / metersPerPx);
+            if (rad >= 3.0f) {
+                Gdiplus::SolidBrush wash(Gdiplus::Color(52, 200, 16, 46));
+                g.FillEllipse(&wash, sx - rad, sy - rad, rad * 2.0f, rad * 2.0f);
+                Gdiplus::Pen ring(Gdiplus::Color(210, 200, 16, 46), rad > 40.0f ? 2.5f : 1.5f);
+                g.DrawEllipse(&ring, sx - rad, sy - rad, rad * 2.0f, rad * 2.0f);
+            }
+            Gdiplus::SolidBrush fill(Gdiplus::Color(230, 20, 90, 50));
+            g.FillEllipse(&fill, sx - 7.0f, sy - 7.0f, 14.0f, 14.0f);
+            Gdiplus::Font labelFont(L"Segoe UI", 10, Gdiplus::FontStyleBold);
+            std::wstring label = widen(p.name.empty() ? "Place" : p.name) + L"  " + std::to_wstring(static_cast<int>(p.radius)) + L" m";
+            Gdiplus::RectF measured;
+            g.MeasureString(label.c_str(), -1, &labelFont, Gdiplus::PointF(0, 0), &measured);
+            Gdiplus::SolidBrush chip(Gdiplus::Color(225, 247, 244, 238));
+            Gdiplus::RectF chipRect(sx + 12.0f, sy - measured.Height * 0.5f - 2.0f, measured.Width + 12.0f, measured.Height + 4.0f);
+            g.FillRectangle(&chip, chipRect);
+            Gdiplus::Pen chipEdge(Gdiplus::Color(180, 26, 25, 22), 1.0f);
+            g.DrawRectangle(&chipEdge, chipRect);
+            Gdiplus::SolidBrush ink(Gdiplus::Color(255, 26, 25, 22));
+            g.DrawString(label.c_str(), -1, &labelFont, Gdiplus::PointF(chipRect.X + 6.0f, chipRect.Y + 2.0f), &ink);
         }
         struct Cluster {
             double lat = 0;
