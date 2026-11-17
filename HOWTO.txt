@@ -29,7 +29,13 @@ The window shows two addresses, both with port 8000:
 
 The map shows everyone who has sent a pin. View, then Satellite switches to aerial photos. View, then Pause updates freezes the map and the list. Drag to move the map. The wheel zooms.
 
-People and places are listed by group, with Edit and Delete on each row. Deleting a group removes its people, photos, and places.
+People and places are listed by group. Edit and Delete sit on their own row so they do not cover the name. Deleting a group removes its people, photos, and places.
+
+Each saved place has its own arrive and leave distance, in meters. Edit the place and change "Arrive and leave radius". Someone is arrived while they are inside that place's distance, and left once they move past it. A park can be wider than a house.
+
+History, the button at the top of the window, shows recent check-ins in plain language. File, then Check-in database, is the same trail as coordinates, for troubleshooting.
+
+Profile photos update when a phone saves a new one. Battery percentage is shown on each person when the phone sends it.
 
 File, then Open saved data opens the folder next to the program. File, then Exit stops the program, the same as closing the window.
 

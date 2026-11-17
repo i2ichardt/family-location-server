@@ -62,6 +62,8 @@ struct Member {
     double speed = 0;
     long long departed = 0;
     std::string departedFrom;
+    int battery = -1;
+    unsigned long long imageHash = 0;
 };
 
 struct Place {
@@ -73,6 +75,18 @@ struct Place {
     double radius = 100;
 };
 
+struct CheckIn {
+    long long ts = 0;
+    std::string groupId;
+    std::string userId;
+    std::string name;
+    std::string area;
+    double lat = 0;
+    double lon = 0;
+    int battery = -1;
+};
+
+static std::vector<CheckIn> g_history;
 static std::mutex g_mu;
 static std::mutex g_wait_mu;
 static std::condition_variable g_cv;
@@ -174,6 +188,8 @@ static void save_locked() {
             {"speed", m.speed},
             {"departed", m.departed},
             {"departedFrom", m.departedFrom},
+            {"battery", m.battery},
+            {"imageHash", m.imageHash},
         });
     }
     json places = json::array();
@@ -203,13 +219,129 @@ static void save_locked() {
     if (ec) fs::copy_file(tmp, dest, fs::copy_options::overwrite_existing, ec);
 }
 
+static void save_history_locked();
+
 static void commit_locked() {
     save_locked();
+    save_history_locked();
     {
         std::lock_guard<std::mutex> lock(g_wait_mu);
         g_rev++;
     }
     g_cv.notify_all();
+}
+
+static unsigned long long image_hash(const std::vector<unsigned char>& bytes) {
+    unsigned long long h = 1469598103934665603ULL;
+    for (unsigned char c : bytes) {
+        h ^= c;
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static bool write_avatar(const std::string& group, const std::string& user, const std::vector<unsigned char>& bytes) {
+    std::error_code ec;
+    fs::create_directories(g_root / "avatars", ec);
+    fs::path path = avatar_path(group, user);
+    fs::path tmp = path;
+    tmp += ".tmp";
+    {
+        std::ofstream out(tmp, std::ios::binary);
+        if (!out) return false;
+        out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+        if (!out) return false;
+    }
+    fs::rename(tmp, path, ec);
+    if (ec) {
+        fs::remove(path, ec);
+        fs::rename(tmp, path, ec);
+    }
+    return !ec && fs::exists(path);
+}
+
+static void save_history_locked() {
+    json rows = json::array();
+    for (const CheckIn& c : g_history) {
+        rows.push_back({
+            {"ts", c.ts},
+            {"groupId", c.groupId},
+            {"userId", c.userId},
+            {"name", c.name},
+            {"area", c.area},
+            {"lat", c.lat},
+            {"lon", c.lon},
+            {"battery", c.battery},
+        });
+    }
+    fs::path tmp = g_root / "history.json.tmp";
+    fs::path dest = g_root / "history.json";
+    {
+        std::ofstream out(tmp, std::ios::binary);
+        out << rows.dump();
+    }
+    std::error_code ec;
+    fs::rename(tmp, dest, ec);
+    if (ec) {
+        fs::remove(dest, ec);
+        fs::rename(tmp, dest, ec);
+    }
+}
+
+static void load_history() {
+    fs::path dest = g_root / "history.json";
+    if (!fs::exists(dest)) return;
+    std::ifstream in(dest);
+    if (!in) return;
+    json rows;
+    try {
+        in >> rows;
+    } catch (...) {
+        return;
+    }
+    if (!rows.is_array()) return;
+    g_history.clear();
+    for (const auto& j : rows) {
+        CheckIn c;
+        c.ts = j.value("ts", 0LL);
+        c.groupId = j.value("groupId", "");
+        c.userId = j.value("userId", "");
+        if (c.userId.empty() || c.groupId.empty()) continue;
+        c.name = j.value("name", "");
+        c.area = j.value("area", "");
+        c.lat = j.value("lat", 0.0);
+        c.lon = j.value("lon", 0.0);
+        c.battery = j.value("battery", -1);
+        g_history.push_back(c);
+    }
+}
+
+static void note_checkin_locked(const Member& m) {
+    for (int i = static_cast<int>(g_history.size()) - 1; i >= 0; --i) {
+        CheckIn& last = g_history[static_cast<size_t>(i)];
+        if (last.groupId != m.groupId || last.userId != m.userId) continue;
+        bool sameSpot = last.area == m.area && haversine_m(last.lat, last.lon, m.lat, m.lon) < 20.0;
+        if (sameSpot && m.ts >= last.ts && m.ts - last.ts < 180) {
+            last.ts = m.ts;
+            last.lat = m.lat;
+            last.lon = m.lon;
+            last.battery = m.battery;
+            last.name = m.name.empty() ? m.userId : m.name;
+            return;
+        }
+        break;
+    }
+    CheckIn c;
+    c.ts = m.ts;
+    c.groupId = m.groupId;
+    c.userId = m.userId;
+    c.name = m.name.empty() ? m.userId : m.name;
+    c.area = m.area;
+    c.lat = m.lat;
+    c.lon = m.lon;
+    c.battery = m.battery;
+    g_history.push_back(c);
+    if (g_history.size() > 800) g_history.erase(g_history.begin(), g_history.begin() + static_cast<long long>(g_history.size() - 800));
 }
 
 static void load_store() {
@@ -245,6 +377,8 @@ static void load_store() {
             m.speed = j.value("speed", 0.0);
             m.departed = j.value("departed", 0LL);
             m.departedFrom = j.value("departedFrom", "");
+            m.battery = j.value("battery", -1);
+            m.imageHash = j.value("imageHash", 0ULL);
             g_members[key_of(m.groupId, m.userId)] = m;
         }
     }
@@ -261,6 +395,7 @@ static void load_store() {
             g_places[key_of(p.groupId, p.id)] = p;
         }
     }
+    load_history();
 }
 
 static Member& ensure_member(const std::string& group, const std::string& user) {
@@ -316,43 +451,55 @@ static void setup_routes(httplib::Server& server) {
             {
                 std::lock_guard<std::mutex> lock(g_mu);
                 Member& m = ensure_member(groupId, userId);
+                if (j.contains("battery") && j["battery"].is_number()) {
+                    int battery = j["battery"].get<int>();
+                    if (battery >= 0 && battery <= 100) m.battery = battery;
+                }
+                const Place* here = nullptr;
+                for (const auto& kv : g_places) {
+                    const Place& p = kv.second;
+                    if (p.groupId != groupId) continue;
+                    double rad = p.radius < 20 ? 20 : p.radius;
+                    if (haversine_m(lat, lon, p.lat, p.lon) <= rad) {
+                        if (!here || rad < here->radius) here = &p;
+                    }
+                }
+                std::string prevArea = m.area;
+                std::string nextArea = here ? here->name : "";
+                auto mark_arrived = [&]() {
+                    m.traveling = false;
+                    m.arrived = ts;
+                    m.anchorLat = lat;
+                    m.anchorLon = lon;
+                };
                 if (hasSpeed) {
                     bool moving = m.traveling ? speed >= 0.6 : speed >= 1.2;
                     if (moving) {
                         if (!m.traveling) {
                             m.traveling = true;
                             m.departed = ts;
-                            m.departedFrom = m.area.empty() ? "this spot" : m.area;
+                            m.departedFrom = prevArea.empty() ? "this spot" : prevArea;
                         }
-                    } else if (m.traveling || m.arrived <= 0 || haversine_m(m.anchorLat, m.anchorLon, lat, lon) > 120.0) {
-                        m.traveling = false;
-                        m.arrived = ts;
-                        m.anchorLat = lat;
-                        m.anchorLon = lon;
+                    } else {
+                        bool changedPlace = nextArea != prevArea;
+                        bool wandered = nextArea.empty() && prevArea.empty()
+                            && (m.arrived <= 0 || haversine_m(m.anchorLat, m.anchorLon, lat, lon) > 120.0);
+                        if (m.traveling || changedPlace || wandered || m.arrived <= 0) mark_arrived();
                     }
                     m.speed = speed;
                 } else {
-                    bool moved = !m.hasLoc || m.arrived <= 0 || haversine_m(m.anchorLat, m.anchorLon, lat, lon) > 120.0;
-                    if (moved) {
-                        m.arrived = ts;
-                        m.anchorLat = lat;
-                        m.anchorLon = lon;
-                    }
+                    bool changedPlace = nextArea != prevArea;
+                    bool wandered = nextArea.empty() && prevArea.empty()
+                        && (!m.hasLoc || m.arrived <= 0 || haversine_m(m.anchorLat, m.anchorLon, lat, lon) > 120.0);
+                    if (changedPlace || wandered) mark_arrived();
                     m.traveling = false;
                 }
                 m.lat = lat;
                 m.lon = lon;
                 m.ts = ts;
                 m.hasLoc = true;
-                m.area.clear();
-                for (const auto& kv : g_places) {
-                    const Place& p = kv.second;
-                    if (p.groupId != groupId) continue;
-                    if (haversine_m(lat, lon, p.lat, p.lon) <= p.radius) {
-                        m.area = p.name;
-                        break;
-                    }
-                }
+                m.area = nextArea;
+                note_checkin_locked(m);
                 commit_locked();
             }
             json resp;
@@ -412,6 +559,7 @@ static void setup_routes(httplib::Server& server) {
             std::string phone = clip(j.value("phone", ""), 40);
             bool wroteImage = false;
             long long imageTs = 0;
+            unsigned long long imageHash = 0;
             if (j.contains("image") && j["image"].is_string()) {
                 auto bytes = decode64(j["image"].get<std::string>());
                 if (bytes.size() > 400000) {
@@ -419,14 +567,24 @@ static void setup_routes(httplib::Server& server) {
                     return;
                 }
                 if (!bytes.empty()) {
-                    fs::create_directories(g_root / "avatars");
-                    fs::path path = avatar_path(groupId, userId);
-                    std::ofstream out(path, std::ios::binary);
-                    out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
-                    wroteImage = true;
-                    imageTs = std::chrono::duration_cast<std::chrono::seconds>(
-                                  std::chrono::system_clock::now().time_since_epoch())
-                                  .count();
+                    imageHash = image_hash(bytes);
+                    bool unchanged = false;
+                    {
+                        std::lock_guard<std::mutex> lock(g_mu);
+                        auto it = g_members.find(key_of(groupId, userId));
+                        unchanged = it != g_members.end() && it->second.hasImage && it->second.imageHash == imageHash
+                            && fs::exists(avatar_path(groupId, userId));
+                    }
+                    if (!unchanged) {
+                        if (!write_avatar(groupId, userId, bytes)) {
+                            json_error(res, 500, "Could not store photo");
+                            return;
+                        }
+                        wroteImage = true;
+                        imageTs = std::chrono::duration_cast<std::chrono::seconds>(
+                                      std::chrono::system_clock::now().time_since_epoch())
+                                      .count();
+                    }
                 }
             }
             {
@@ -437,6 +595,7 @@ static void setup_routes(httplib::Server& server) {
                 if (wroteImage) {
                     m.hasImage = true;
                     m.imageTs = imageTs;
+                    m.imageHash = imageHash;
                 }
                 commit_locked();
             }
@@ -468,6 +627,7 @@ static void setup_routes(httplib::Server& server) {
                 one["hasLoc"] = m.hasLoc;
                 one["hasImage"] = m.hasImage;
                 one["imageTs"] = m.imageTs;
+                one["battery"] = m.battery;
                 if (m.hasLoc) {
                     one["lat"] = m.lat;
                     one["lon"] = m.lon;
@@ -520,6 +680,7 @@ static void setup_routes(httplib::Server& server) {
         std::ifstream in(path, std::ios::binary);
         std::ostringstream ss;
         ss << in.rdbuf();
+        res.set_header("Cache-Control", "no-store");
         res.set_content(ss.str(), "image/jpeg");
     });
 
@@ -717,6 +878,8 @@ static void add_item(HWND list, int row, const std::vector<std::wstring>& cells)
     }
 }
 
+static HWND make_list(HWND parent, int id, int x, int y, int w, int height);
+
 #include "map_win.inc"
 
 static void fill_lists() {
@@ -734,7 +897,7 @@ static void fill_lists() {
     }
     std::string sig;
     for (const Member& m : members) {
-        sig += m.groupId + m.userId + m.name + std::to_string(m.lat) + std::to_string(m.lon) + std::to_string(m.imageTs) + m.area;
+        sig += m.groupId + m.userId + m.name + std::to_string(m.lat) + std::to_string(m.lon) + std::to_string(m.imageTs) + m.area + std::to_string(m.battery);
     }
     for (const Place& p : places) sig += p.id + p.name + std::to_string(p.lat);
     bool changed = sig != g_list_sig;
@@ -851,7 +1014,8 @@ static void layout_main(HWND hwnd) {
     int h = rc.bottom;
     if (w < 80 || h < 80) return;
     const int margin = 16;
-    if (g_homeLabel) MoveWindow(g_homeLabel, margin, 10, w - margin * 2, 22, TRUE);
+    if (g_homeLabel) MoveWindow(g_homeLabel, margin, 10, w - margin * 2 - 120, 22, TRUE);
+    if (g_historyBtn) MoveWindow(g_historyBtn, w - margin - 108, 8, 108, 28, TRUE);
     if (g_tailLive) MoveWindow(g_tailLive, margin, 34, w - margin * 2, 22, TRUE);
     int top = 66;
     int content = h - top - 56;
@@ -900,6 +1064,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (LOWORD(wp) == ID_OPEN) open_data();
         if (LOWORD(wp) == 200) open_settings(hwnd);
         if (LOWORD(wp) == 201) DestroyWindow(hwnd);
+        if (LOWORD(wp) == 210) open_history(hwnd);
+        if (LOWORD(wp) == 211) open_checkin_db(hwnd);
         if (LOWORD(wp) == 121) {
             toggle_satellite();
             sync_menu(hwnd);
@@ -972,6 +1138,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int show) {
 
     HMENU file = CreatePopupMenu();
     AppendMenuW(file, MF_STRING, 200, L"Settings...");
+    AppendMenuW(file, MF_STRING, 211, L"Check-in database...");
     AppendMenuW(file, MF_STRING, ID_OPEN, L"Open saved data");
     AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(file, MF_STRING, 201, L"Exit");
@@ -984,6 +1151,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int show) {
     SetMenu(g_hwnd, bar);
 
     g_homeLabel = make_label(g_hwnd, L"Home", 16, 8, 400, 20, 0);
+    g_historyBtn = make_button(g_hwnd, L"History", 16, 8, 108, 28, 210);
     g_tailLive = make_label(g_hwnd, L"Tailscale", 16, 30, 400, 20, 0);
 
     create_map(g_hwnd);
@@ -991,7 +1159,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int show) {
 
     g_statusLabel = make_label(g_hwnd, L"Starting", 16, 610, 400, 20, ID_STATUS);
     g_note = make_label(g_hwnd,
-        L"File, Settings holds the saved Tailscale address. Minimize stays on the taskbar. Close stops the program.",
+        L"Each place has its own arrive and leave distance. Edit a place to change it. History is the recent check-ins.",
         16, 636, 400, 22, ID_NOTE);
 
     g_server = new httplib::Server();

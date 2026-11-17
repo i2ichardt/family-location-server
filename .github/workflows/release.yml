@@ -19,4 +19,4 @@ jobs:
             FamilyLocationServer.exe \
             FamilyLocationServer-windows.zip \
             --title "Family location server ${GITHUB_REF_NAME#v}" \
-            --notes "Compiled Windows server. The zip includes the how-to and the firewall script. File, then Settings, holds the saved Tailscale address. Minimize keeps it on the taskbar. Closing the window stops the program."
+            --notes "Compiled Windows server. Each saved place has its own arrive and leave distance. History shows recent check-ins. File, Check-in database, lists the coordinates. Profile photos and battery percentage update from the phones."

@@ -6,16 +6,16 @@ The phone app is [location-test](https://github.com/i2ichardt/location-test).
 
 ## Download
 
-The compiled program is on the [v1.3 release](https://github.com/i2ichardt/family-location-server/releases/tag/v1.3).
+The compiled program is on the [v1.4 release](https://github.com/i2ichardt/family-location-server/releases/tag/v1.4).
 
-- [FamilyLocationServer.exe](https://github.com/i2ichardt/family-location-server/releases/download/v1.3/FamilyLocationServer.exe)
-- [FamilyLocationServer-windows.zip](https://github.com/i2ichardt/family-location-server/releases/download/v1.3/FamilyLocationServer-windows.zip) — program, how-to, and firewall script
+- [FamilyLocationServer.exe](https://github.com/i2ichardt/family-location-server/releases/download/v1.4/FamilyLocationServer.exe)
+- [FamilyLocationServer-windows.zip](https://github.com/i2ichardt/family-location-server/releases/download/v1.4/FamilyLocationServer-windows.zip) — program, how-to, and firewall script
 
 ## On the PC
 
 The window lists **Home** as `http://<LAN address>:8000` and **Tailscale** as `http://<100.x address>:8000`. The saved Tailscale address, the one phones use when they are away, is under **File → Settings**.
 
-The map shows the people who have sent a pin. **View → Satellite** switches to aerial photos. **View → Pause updates** freezes the map and the list. Profile photos are the pins. People and places are listed by group, with edit and delete on each row.
+The map shows the people who have sent a pin. People standing together share one pin, side by side. **View → Satellite** switches to aerial photos. **View → Pause updates** freezes the map and the list. Profile photos are the pins and update when a phone saves a new one. **History** shows recent check-ins. **File → Check-in database** is the same trail as coordinates. Each place has its own arrive and leave distance. Edit the place to change how many meters count as arrived or left. Battery percentage shows on each person when the phone sends it.
 
 ## Run it
 
