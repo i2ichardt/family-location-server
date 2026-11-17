@@ -19,4 +19,4 @@ jobs:
             FamilyLocationServer.exe \
             FamilyLocationServer-windows.zip \
             --title "Family location server ${GITHUB_REF_NAME#v}" \
-            --notes "Compiled Windows server. Each saved place draws its arrive and leave distance as a circle on the map. History shows recent check-ins. File, Check-in database, lists the coordinates."
+            --notes "Compiled Windows server. Profile photos can be larger so the phone can show a sharp picture. Each place still draws its arrive and leave circle."

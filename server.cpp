@@ -562,7 +562,7 @@ static void setup_routes(httplib::Server& server) {
             unsigned long long imageHash = 0;
             if (j.contains("image") && j["image"].is_string()) {
                 auto bytes = decode64(j["image"].get<std::string>());
-                if (bytes.size() > 400000) {
+                if (bytes.size() > 1400000) {
                     json_error(res, 400, "Image too large");
                     return;
                 }
