@@ -466,6 +466,7 @@ static void setup_routes(httplib::Server& server) {
                 }
                 std::string prevArea = m.area;
                 std::string nextArea = here ? here->name : "";
+                bool changedPlace = nextArea != prevArea;
                 auto mark_arrived = [&]() {
                     m.traveling = false;
                     m.arrived = ts;
@@ -473,26 +474,29 @@ static void setup_routes(httplib::Server& server) {
                     m.anchorLon = lon;
                 };
                 if (hasSpeed) {
-                    bool moving = m.traveling ? speed >= 0.6 : speed >= 1.2;
-                    if (moving) {
+                    bool crawling = m.traveling ? speed < 0.6 : speed < 1.2;
+                    bool still = !m.hasLoc || haversine_m(m.lat, m.lon, lat, lon) < 35.0;
+                    if (!crawling || !still) {
                         if (!m.traveling) {
                             m.traveling = true;
                             m.departed = ts;
                             m.departedFrom = prevArea.empty() ? "this spot" : prevArea;
                         }
-                    } else {
-                        bool changedPlace = nextArea != prevArea;
-                        bool wandered = nextArea.empty() && prevArea.empty()
-                            && (m.arrived <= 0 || haversine_m(m.anchorLat, m.anchorLon, lat, lon) > 120.0);
-                        if (m.traveling || changedPlace || wandered || m.arrived <= 0) mark_arrived();
+                    } else if (m.traveling || changedPlace || m.arrived <= 0) {
+                        mark_arrived();
                     }
                     m.speed = speed;
                 } else {
-                    bool changedPlace = nextArea != prevArea;
-                    bool wandered = nextArea.empty() && prevArea.empty()
-                        && (!m.hasLoc || m.arrived <= 0 || haversine_m(m.anchorLat, m.anchorLon, lat, lon) > 120.0);
-                    if (changedPlace || wandered) mark_arrived();
-                    m.traveling = false;
+                    bool still = !m.hasLoc || haversine_m(m.lat, m.lon, lat, lon) < 35.0;
+                    if (!still) {
+                        if (!m.traveling) {
+                            m.traveling = true;
+                            m.departed = ts;
+                            m.departedFrom = prevArea.empty() ? "this spot" : prevArea;
+                        }
+                    } else if (m.traveling || changedPlace || m.arrived <= 0) {
+                        mark_arrived();
+                    }
                 }
                 m.lat = lat;
                 m.lon = lon;
@@ -899,7 +903,7 @@ static void fill_lists() {
     for (const Member& m : members) {
         sig += m.groupId + m.userId + m.name + std::to_string(m.lat) + std::to_string(m.lon) + std::to_string(m.imageTs) + m.area + std::to_string(m.battery);
     }
-    for (const Place& p : places) sig += p.id + p.name + std::to_string(p.lat);
+    for (const Place& p : places) sig += p.id + p.name + std::to_string(p.lat) + std::to_string(p.lon) + std::to_string(p.radius);
     bool changed = sig != g_list_sig;
     g_list_sig = sig;
     g_row_people = members;
@@ -1014,8 +1018,7 @@ static void layout_main(HWND hwnd) {
     int h = rc.bottom;
     if (w < 80 || h < 80) return;
     const int margin = 16;
-    if (g_homeLabel) MoveWindow(g_homeLabel, margin, 10, w - margin * 2 - 120, 22, TRUE);
-    if (g_historyBtn) MoveWindow(g_historyBtn, w - margin - 108, 8, 108, 28, TRUE);
+    if (g_homeLabel) MoveWindow(g_homeLabel, margin, 10, w - margin * 2, 22, TRUE);
     if (g_tailLive) MoveWindow(g_tailLive, margin, 34, w - margin * 2, 22, TRUE);
     int top = 66;
     int content = h - top - 56;
@@ -1064,7 +1067,6 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (LOWORD(wp) == ID_OPEN) open_data();
         if (LOWORD(wp) == 200) open_settings(hwnd);
         if (LOWORD(wp) == 201) DestroyWindow(hwnd);
-        if (LOWORD(wp) == 210) open_history(hwnd);
         if (LOWORD(wp) == 211) open_checkin_db(hwnd);
         if (LOWORD(wp) == 121) {
             toggle_satellite();
@@ -1151,7 +1153,6 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int show) {
     SetMenu(g_hwnd, bar);
 
     g_homeLabel = make_label(g_hwnd, L"Home", 16, 8, 400, 20, 0);
-    g_historyBtn = make_button(g_hwnd, L"History", 16, 8, 108, 28, 210);
     g_tailLive = make_label(g_hwnd, L"Tailscale", 16, 30, 400, 20, 0);
 
     create_map(g_hwnd);
@@ -1159,7 +1160,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int show) {
 
     g_statusLabel = make_label(g_hwnd, L"Starting", 16, 610, 400, 20, ID_STATUS);
     g_note = make_label(g_hwnd,
-        L"Each place has its own arrive and leave distance. Edit a place to change it. History is the recent check-ins.",
+        L"Drag a place on the map to move it. Scroll the wheel while it is selected to change its arrive and leave distance. History is on each person.",
         16, 636, 400, 22, ID_NOTE);
 
     g_server = new httplib::Server();

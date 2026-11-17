@@ -27,13 +27,13 @@ The window shows two addresses, both with port 8000:
 - Tailscale is filled in when Tailscale is connected.
 - The saved Tailscale address is under File, then Settings. That is the address phones use when they are away. Include http:// and :8000.
 
-The map shows everyone who has sent a pin. View, then Satellite switches to aerial photos. View, then Pause updates freezes the map and the list. Drag to move the map. The wheel zooms.
+The map shows everyone who has sent a pin. View, then Satellite switches to aerial photos. View, then Pause updates freezes the map and the list. Drag empty map to pan. The wheel zooms, unless a place is selected.
 
-People and places are listed by group. Edit and Delete sit on their own row so they do not cover the name. Deleting a group removes its people, photos, and places.
+People and places are listed by group. Each person has History, Edit, and Delete. History shows only that person's check-ins. File, then Check-in database, is the full trail as coordinates. Deleting a group removes its people, photos, and places.
 
-Each saved place has its own arrive and leave distance, in meters. Edit the place and change "Arrive and leave radius". Someone is arrived while they are inside that place's distance, and left once they move past it. A park can be wider than a house.
+Each saved place has its own arrive and leave distance, in meters. Drag a place's dot on the map to move it. Click a place to select it, then scroll the mouse wheel to change its distance. The circle on the map is that distance. Someone is arrived while they are inside it, and left once they move past it. A park can be wider than a house.
 
-History, the button at the top of the window, shows recent check-ins in plain language. File, then Check-in database, is the same trail as coordinates, for troubleshooting.
+Click empty map to clear the selection so the wheel zooms again.
 
 Profile photos update when a phone saves a new one. Battery percentage is shown on each person when the phone sends it.
 

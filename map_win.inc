@@ -20,6 +20,7 @@ static bool g_live = true;
 static std::string g_list_sig;
 static HWND g_roster = nullptr;
 static HWND g_historyBtn = nullptr;
+static void open_history(HWND owner, const std::string& group, const std::string& user, const std::string& name);
 static std::string g_tail_saved;
 static bool g_tail_seeded = false;
 static bool g_satellite = false;
@@ -390,20 +391,126 @@ static Gdiplus::Bitmap* face_bitmap(const Member& m) {
     return loaded;
 }
 
+static std::string g_sel_group;
+static std::string g_sel_id;
+static bool g_place_drag = false;
+static int g_press_x = 0;
+static int g_press_y = 0;
+
+static void map_origin(HWND hwnd, double& left, double& top) {
+    RECT rc;
+    GetClientRect(hwnd, &rc);
+    double cx, cy;
+    project_xy(g_map_state.lat, g_map_state.lon, g_map_state.zoom, cx, cy);
+    left = cx - rc.right / 2.0;
+    top = cy - rc.bottom / 2.0;
+}
+
+static int place_at_pixel(HWND hwnd, int x, int y) {
+    double left, top;
+    map_origin(hwnd, left, top);
+    int best = -1;
+    double bestD = 26.0 * 26.0;
+    for (int i = 0; i < static_cast<int>(g_row_places.size()); i++) {
+        double px, py;
+        project_xy(g_row_places[i].lat, g_row_places[i].lon, g_map_state.zoom, px, py);
+        double dx = (px - left) - x;
+        double dy = (py - top) - y;
+        double d = dx * dx + dy * dy;
+        if (d < bestD) {
+            bestD = d;
+            best = i;
+        }
+    }
+    return best;
+}
+
+static void apply_place_edit(const std::string& group, const std::string& id, double lat, double lon, double radius, bool save) {
+    if (radius < 20) radius = 20;
+    if (radius > 5000) radius = 5000;
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        auto it = g_places.find(key_of(group, id));
+        if (it == g_places.end()) return;
+        it->second.lat = lat;
+        it->second.lon = lon;
+        it->second.radius = radius;
+        if (save) commit_locked();
+    }
+    for (Place& p : g_row_places) {
+        if (p.groupId == group && p.id == id) {
+            p.lat = lat;
+            p.lon = lon;
+            p.radius = radius;
+        }
+    }
+}
+
+static bool selected_place(Place& out) {
+    for (const Place& p : g_row_places) {
+        if (p.groupId == g_sel_group && p.id == g_sel_id) {
+            out = p;
+            return true;
+        }
+    }
+    return false;
+}
+
 static LRESULT CALLBACK map_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
-    case WM_LBUTTONDOWN:
-        g_map_state.dragging = true;
-        g_map_state.last_x = GET_X_LPARAM(lp);
-        g_map_state.last_y = GET_Y_LPARAM(lp);
+    case WM_LBUTTONDOWN: {
+        int x = GET_X_LPARAM(lp);
+        int y = GET_Y_LPARAM(lp);
+        g_press_x = x;
+        g_press_y = y;
+        int hit = place_at_pixel(hwnd, x, y);
+        if (hit >= 0) {
+            g_sel_group = g_row_places[hit].groupId;
+            g_sel_id = g_row_places[hit].id;
+            g_place_drag = true;
+            g_map_state.dragging = false;
+        } else {
+            g_place_drag = false;
+            g_map_state.dragging = true;
+            g_map_state.last_x = x;
+            g_map_state.last_y = y;
+        }
         SetCapture(hwnd);
+        InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
-    case WM_LBUTTONUP:
+    }
+    case WM_LBUTTONUP: {
+        int x = GET_X_LPARAM(lp);
+        int y = GET_Y_LPARAM(lp);
+        if (g_place_drag) {
+            Place cur;
+            if (selected_place(cur)) apply_place_edit(cur.groupId, cur.id, cur.lat, cur.lon, cur.radius, true);
+        } else {
+            int dx = x - g_press_x;
+            int dy = y - g_press_y;
+            if (dx * dx + dy * dy < 16 && place_at_pixel(hwnd, x, y) < 0) {
+                g_sel_group.clear();
+                g_sel_id.clear();
+            }
+        }
+        g_place_drag = false;
         g_map_state.dragging = false;
         ReleaseCapture();
+        InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
+    }
     case WM_MOUSEMOVE:
-        if (g_map_state.dragging) {
+        if (g_place_drag) {
+            Place cur;
+            if (selected_place(cur)) {
+                double left, top;
+                map_origin(hwnd, left, top);
+                double lat, lon;
+                unproject_xy(left + GET_X_LPARAM(lp), top + GET_Y_LPARAM(lp), g_map_state.zoom, lat, lon);
+                apply_place_edit(cur.groupId, cur.id, lat, lon, cur.radius, false);
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+        } else if (g_map_state.dragging) {
             int x = GET_X_LPARAM(lp);
             int y = GET_Y_LPARAM(lp);
             double px, py;
@@ -419,9 +526,17 @@ static LRESULT CALLBACK map_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_MOUSEWHEEL: {
         int delta = GET_WHEEL_DELTA_WPARAM(wp);
-        if (delta > 0 && g_map_state.zoom < 18) g_map_state.zoom++;
-        if (delta < 0 && g_map_state.zoom > 3) g_map_state.zoom--;
-        g_map_state.moved = true;
+        Place cur;
+        if (selected_place(cur)) {
+            int notches = delta / WHEEL_DELTA;
+            if (notches == 0) notches = delta > 0 ? 1 : -1;
+            double radius = cur.radius + notches * 15.0;
+            apply_place_edit(cur.groupId, cur.id, cur.lat, cur.lon, radius, true);
+        } else {
+            if (delta > 0 && g_map_state.zoom < 18) g_map_state.zoom++;
+            if (delta < 0 && g_map_state.zoom > 3) g_map_state.zoom--;
+            g_map_state.moved = true;
+        }
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
     }
@@ -499,9 +614,10 @@ static LRESULT CALLBACK map_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             double metersPerPx = cosLat * 40075016.685578488 / (256.0 * static_cast<double>(1 << g_map_state.zoom));
             float rad = static_cast<float>(p.radius / metersPerPx);
             if (rad >= 3.0f) {
-                Gdiplus::SolidBrush wash(Gdiplus::Color(52, 200, 16, 46));
+                bool selected = p.groupId == g_sel_group && p.id == g_sel_id;
+                Gdiplus::SolidBrush wash(selected ? Gdiplus::Color(70, 47, 107, 255) : Gdiplus::Color(52, 200, 16, 46));
                 g.FillEllipse(&wash, sx - rad, sy - rad, rad * 2.0f, rad * 2.0f);
-                Gdiplus::Pen ring(Gdiplus::Color(210, 200, 16, 46), rad > 40.0f ? 2.5f : 1.5f);
+                Gdiplus::Pen ring(selected ? Gdiplus::Color(255, 47, 107, 255) : Gdiplus::Color(210, 200, 16, 46), selected ? 3.0f : (rad > 40.0f ? 2.5f : 1.5f));
                 g.DrawEllipse(&ring, sx - rad, sy - rad, rad * 2.0f, rad * 2.0f);
             }
             Gdiplus::SolidBrush fill(Gdiplus::Color(230, 20, 90, 50));
@@ -907,6 +1023,16 @@ static LRESULT CALLBACK roster_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (h.action == 2 && MessageBoxW(g_hwnd, (L"Delete group " + widen(h.group) + L" and everyone in it?").c_str(), L"Family", MB_YESNO | MB_ICONWARNING) == IDYES) remove_group_id(h.group);
                 if (h.action == 3) edit_person_ui(h.group, h.id);
                 if (h.action == 4 && MessageBoxW(g_hwnd, L"Remove this person?", L"Family", MB_YESNO | MB_ICONWARNING) == IDYES) remove_member(h.group, h.id);
+                if (h.action == 7) {
+                    std::string name = h.id;
+                    for (const Member& m : g_row_people) {
+                        if (m.groupId == h.group && m.userId == h.id) {
+                            name = m.name.empty() ? m.userId : m.name;
+                            break;
+                        }
+                    }
+                    open_history(g_hwnd, h.group, h.id, name);
+                }
                 if (h.action == 5) edit_place_ui(h.group, h.id);
                 if (h.action == 6 && MessageBoxW(g_hwnd, L"Delete this place?", L"Family", MB_YESNO | MB_ICONWARNING) == IDYES) remove_place_id(h.group, h.id);
                 InvalidateRect(hwnd, nullptr, FALSE);
@@ -961,7 +1087,7 @@ static LRESULT CALLBACK roster_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             for (const Member& m : g_row_people) {
                 if (m.groupId != group) continue;
                 any_person = true;
-                int cardH = 112;
+                int cardH = 124;
                 Gdiplus::SolidBrush card(Gdiplus::Color(255, 255, 252, 247));
                 g.FillRectangle(&card, 8, y, width, cardH);
                 Gdiplus::Bitmap* face = face_bitmap(m);
@@ -990,10 +1116,13 @@ static LRESULT CALLBACK roster_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     Gdiplus::RectF phoneRect(16, static_cast<float>(y + 52), static_cast<float>(width - 32), 18);
                     g.DrawString(phone.c_str(), -1, &small, phoneRect, &clipText, &muted);
                 }
+                RECT hist = hit_rect(width - 236, y + cardH - 34, 72, 26);
                 RECT edit = hit_rect(width - 156, y + cardH - 34, 68, 26);
                 RECT del = hit_rect(width - 80, y + cardH - 34, 68, 26);
+                paint_button(g, hist, L"History", small);
                 paint_button(g, edit, L"Edit", small);
                 paint_button(g, del, L"Delete", small);
+                g_hits.push_back({hist, 7, group, m.userId});
                 g_hits.push_back({edit, 3, group, m.userId});
                 g_hits.push_back({del, 4, group, m.userId});
                 y += cardH + 8;
@@ -1152,10 +1281,20 @@ static HWND g_histWnd = nullptr;
 static std::vector<CheckIn> g_hist_rows;
 static int g_hist_scroll = 0;
 static int g_hist_content = 0;
+static std::string g_hist_group;
+static std::string g_hist_user;
+static std::wstring g_hist_name;
 
 static void reload_hist_rows() {
     g_hist_rows = history_snapshot();
     std::reverse(g_hist_rows.begin(), g_hist_rows.end());
+    if (!g_hist_user.empty()) {
+        std::vector<CheckIn> kept;
+        for (const CheckIn& c : g_hist_rows) {
+            if (c.groupId == g_hist_group && c.userId == g_hist_user) kept.push_back(c);
+        }
+        g_hist_rows.swap(kept);
+    }
 }
 
 static LRESULT CALLBACK hist_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -1194,7 +1333,8 @@ static LRESULT CALLBACK hist_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         Gdiplus::Font body(L"Segoe UI", 11);
         Gdiplus::SolidBrush ink(Gdiplus::Color(255, 28, 27, 25));
         Gdiplus::SolidBrush muted(Gdiplus::Color(255, 92, 88, 79));
-        g.DrawString(L"Recent check-ins", -1, &title, Gdiplus::PointF(20, 16), &ink);
+        std::wstring heading = g_hist_name.empty() ? L"Recent check-ins" : (g_hist_name + L"'s check-ins");
+        g.DrawString(heading.c_str(), -1, &title, Gdiplus::PointF(20, 16), &ink);
         int y = 58;
         int width = rc.right - 40;
         if (width < 200) width = 200;
@@ -1241,10 +1381,15 @@ static LRESULT CALLBACK hist_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
 }
 
-static void open_history(HWND owner) {
+static void open_history(HWND owner, const std::string& group, const std::string& user, const std::string& name) {
+    g_hist_group = group;
+    g_hist_user = user;
+    g_hist_name = widen(name.empty() ? user : name);
     reload_hist_rows();
     g_hist_scroll = 0;
+    std::wstring title = g_hist_name + L" history";
     if (g_histWnd) {
+        SetWindowTextW(g_histWnd, title.c_str());
         InvalidateRect(g_histWnd, nullptr, FALSE);
         SetForegroundWindow(g_histWnd);
         return;
@@ -1260,7 +1405,7 @@ static void open_history(HWND owner) {
         RegisterClassW(&wc);
         registered = true;
     }
-    g_histWnd = CreateWindowExW(0, L"FamilyHistory", L"History",
+    g_histWnd = CreateWindowExW(0, L"FamilyHistory", title.c_str(),
         WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 560, 720,
         owner, nullptr, GetModuleHandleW(nullptr), nullptr);
     SetTimer(g_histWnd, 1, 3000, nullptr);

@@ -6,16 +6,16 @@ The phone app is [location-test](https://github.com/i2ichardt/location-test).
 
 ## Download
 
-The compiled program is on the [v1.6 release](https://github.com/i2ichardt/family-location-server/releases/tag/v1.6).
+The compiled program is on the [v1.7 release](https://github.com/i2ichardt/family-location-server/releases/tag/v1.7).
 
-- [FamilyLocationServer.exe](https://github.com/i2ichardt/family-location-server/releases/download/v1.6/FamilyLocationServer.exe)
-- [FamilyLocationServer-windows.zip](https://github.com/i2ichardt/family-location-server/releases/download/v1.6/FamilyLocationServer-windows.zip) — program, how-to, and firewall script
+- [FamilyLocationServer.exe](https://github.com/i2ichardt/family-location-server/releases/download/v1.7/FamilyLocationServer.exe)
+- [FamilyLocationServer-windows.zip](https://github.com/i2ichardt/family-location-server/releases/download/v1.7/FamilyLocationServer-windows.zip) — program, how-to, and firewall script
 
 ## On the PC
 
 The window lists **Home** as `http://<LAN address>:8000` and **Tailscale** as `http://<100.x address>:8000`. The saved Tailscale address, the one phones use when they are away, is under **File → Settings**.
 
-The map shows the people who have sent a pin. People standing together share one pin, side by side. Each saved place is drawn with a circle the size of its arrive and leave distance, labeled with the meters. **View → Satellite** switches to aerial photos. **View → Pause updates** freezes the map and the list. Profile photos are the pins and update when a phone saves a new one. **History** shows recent check-ins. **File → Check-in database** is the same trail as coordinates. Edit a place to change how many meters count as arrived or left. Battery percentage shows on each person when the phone sends it.
+The map shows the people who have sent a pin. People standing together share one pin, side by side. Each saved place is drawn with a circle the size of its arrive and leave distance, labeled with the meters. Drag a place's dot to move it. Click a place, then scroll the mouse wheel, to change that distance. Click empty map to clear the selection so the wheel zooms again. **View → Satellite** switches to aerial photos. **View → Pause updates** freezes the map and the list. Profile photos are the pins and update when a phone saves a new one. Each person has a **History** button for that person's check-ins. **File → Check-in database** is the full trail as coordinates. Battery percentage shows on each person when the phone sends it.
 
 ## Run it
 
