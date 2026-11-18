@@ -8,7 +8,8 @@
 //   POST /profile   {userId, groupId, name, phone, image?}   image is base64 JPEG
 //   GET  /group?groupId=
 //   GET  /avatar?groupId=&userId=
-//   POST /place     {groupId, id, name, lat, lon, radius}
+//   POST /place     {groupId, id, name, lat, lon, radius, image?}
+//   GET  /placeimg?groupId=&id=
 //   POST /place/delete {groupId, id}
 
 #define WIN32_LEAN_AND_MEAN
@@ -63,6 +64,9 @@ struct Member {
     long long departed = 0;
     std::string departedFrom;
     int battery = -1;
+    int signal = -1;
+    bool locationOff = false;
+    int every = 0;
     unsigned long long imageHash = 0;
 };
 
@@ -73,6 +77,9 @@ struct Place {
     double lat = 0;
     double lon = 0;
     double radius = 100;
+    bool hasImage = false;
+    long long imageTs = 0;
+    unsigned long long imageHash = 0;
 };
 
 struct CheckIn {
@@ -165,6 +172,30 @@ static fs::path avatar_path(const std::string& group, const std::string& user) {
     return g_root / "avatars" / (file_token(group) + "_" + file_token(user) + ".jpg");
 }
 
+static fs::path place_image_path(const std::string& group, const std::string& id) {
+    return g_root / "places" / (file_token(group) + "_" + file_token(id) + ".jpg");
+}
+
+static bool write_place_image(const std::string& group, const std::string& id, const std::vector<unsigned char>& bytes) {
+    std::error_code ec;
+    fs::create_directories(g_root / "places", ec);
+    fs::path path = place_image_path(group, id);
+    fs::path tmp = path;
+    tmp += ".tmp";
+    {
+        std::ofstream out(tmp, std::ios::binary);
+        if (!out) return false;
+        out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+        if (!out) return false;
+    }
+    fs::rename(tmp, path, ec);
+    if (ec) {
+        fs::remove(path, ec);
+        fs::rename(tmp, path, ec);
+    }
+    return !ec && fs::exists(path);
+}
+
 static void save_locked() {
     json members = json::array();
     for (const auto& kv : g_members) {
@@ -189,6 +220,9 @@ static void save_locked() {
             {"departed", m.departed},
             {"departedFrom", m.departedFrom},
             {"battery", m.battery},
+            {"signal", m.signal},
+            {"locationOff", m.locationOff},
+            {"every", m.every},
             {"imageHash", m.imageHash},
         });
     }
@@ -202,6 +236,9 @@ static void save_locked() {
             {"lat", p.lat},
             {"lon", p.lon},
             {"radius", p.radius},
+            {"hasImage", p.hasImage},
+            {"imageTs", p.imageTs},
+            {"imageHash", p.imageHash},
         });
     }
     json root;
@@ -378,6 +415,9 @@ static void load_store() {
             m.departed = j.value("departed", 0LL);
             m.departedFrom = j.value("departedFrom", "");
             m.battery = j.value("battery", -1);
+            m.signal = j.value("signal", -1);
+            m.locationOff = j.value("locationOff", false);
+            m.every = j.value("every", 0);
             m.imageHash = j.value("imageHash", 0ULL);
             g_members[key_of(m.groupId, m.userId)] = m;
         }
@@ -392,6 +432,9 @@ static void load_store() {
             p.lat = j.value("lat", 0.0);
             p.lon = j.value("lon", 0.0);
             p.radius = j.value("radius", 100.0);
+            p.hasImage = j.value("hasImage", false);
+            p.imageTs = j.value("imageTs", 0LL);
+            p.imageHash = j.value("imageHash", 0ULL);
             g_places[key_of(p.groupId, p.id)] = p;
         }
     }
@@ -427,18 +470,19 @@ static void setup_routes(httplib::Server& server) {
     server.Post("/send", [](const httplib::Request& req, httplib::Response& res) {
         try {
             auto j = json::parse(req.body);
-            if (!j.contains("userId") || !j.contains("groupId") || !j.contains("lat") || !j.contains("lon")) {
+            bool locationOff = j.value("locationOff", false);
+            if (!j.contains("userId") || !j.contains("groupId") || (!locationOff && (!j.contains("lat") || !j.contains("lon")))) {
                 json_error(res, 400, "Missing fields");
                 return;
             }
             std::string userId = clip(j["userId"].get<std::string>(), 64);
             std::string groupId = clip(j["groupId"].get<std::string>(), 64);
-            double lat = j["lat"].get<double>();
-            double lon = j["lon"].get<double>();
-            if (userId.empty() || groupId.empty() || !valid_coord(lat, lon)) {
-                json_error(res, 400, "Bad location");
-                return;
-            }
+            int signal = j.contains("signal") && j["signal"].is_number() ? j["signal"].get<int>() : -1;
+            if (signal < -2) signal = -2;
+            if (signal > 4) signal = 4;
+            int every = j.contains("every") && j["every"].is_number() ? j["every"].get<int>() : 0;
+            if (every < 0) every = 0;
+            if (every > 86400) every = 86400;
             long long ts = 0;
             if (j.contains("ts")) ts = j["ts"].get<long long>();
             if (ts <= 0) {
@@ -446,15 +490,43 @@ static void setup_routes(httplib::Server& server) {
                          std::chrono::system_clock::now().time_since_epoch())
                          .count();
             }
+            auto apply_status = [&](Member& m) {
+                if (j.contains("battery") && j["battery"].is_number()) {
+                    int battery = j["battery"].get<int>();
+                    if (battery >= 0 && battery <= 100) m.battery = battery;
+                }
+                if (j.contains("signal")) m.signal = signal;
+                if (j.contains("every")) m.every = every;
+            };
+            if (locationOff) {
+                if (userId.empty() || groupId.empty()) {
+                    json_error(res, 400, "Bad location");
+                    return;
+                }
+                std::lock_guard<std::mutex> lock(g_mu);
+                Member& m = ensure_member(groupId, userId);
+                apply_status(m);
+                m.locationOff = true;
+                m.ts = ts;
+                commit_locked();
+                json resp;
+                resp["status"] = "saved";
+                res.set_content(resp.dump(), "application/json");
+                return;
+            }
+            double lat = j["lat"].get<double>();
+            double lon = j["lon"].get<double>();
+            if (userId.empty() || groupId.empty() || !valid_coord(lat, lon)) {
+                json_error(res, 400, "Bad location");
+                return;
+            }
             bool hasSpeed = j.contains("speed") && j["speed"].is_number();
             double speed = hasSpeed ? j["speed"].get<double>() : 0;
             {
                 std::lock_guard<std::mutex> lock(g_mu);
                 Member& m = ensure_member(groupId, userId);
-                if (j.contains("battery") && j["battery"].is_number()) {
-                    int battery = j["battery"].get<int>();
-                    if (battery >= 0 && battery <= 100) m.battery = battery;
-                }
+                apply_status(m);
+                m.locationOff = false;
                 const Place* here = nullptr;
                 for (const auto& kv : g_places) {
                     const Place& p = kv.second;
@@ -632,6 +704,9 @@ static void setup_routes(httplib::Server& server) {
                 one["hasImage"] = m.hasImage;
                 one["imageTs"] = m.imageTs;
                 one["battery"] = m.battery;
+                one["signal"] = m.signal;
+                one["locationOff"] = m.locationOff;
+                one["every"] = m.every;
                 if (m.hasLoc) {
                     one["lat"] = m.lat;
                     one["lon"] = m.lon;
@@ -654,6 +729,8 @@ static void setup_routes(httplib::Server& server) {
                     {"lat", p.lat},
                     {"lon", p.lon},
                     {"radius", p.radius},
+                    {"hasImage", p.hasImage},
+                    {"imageTs", p.imageTs},
                 });
             }
         }
@@ -688,6 +765,26 @@ static void setup_routes(httplib::Server& server) {
         res.set_content(ss.str(), "image/jpeg");
     });
 
+    server.Get("/placeimg", [](const httplib::Request& req, httplib::Response& res) {
+        std::string id = req.get_param_value("id");
+        std::string groupId = req.get_param_value("groupId");
+        if (id.empty() || groupId.empty()) {
+            json_error(res, 400, "Missing id or groupId");
+            return;
+        }
+        fs::path path = place_image_path(groupId, id);
+        if (!fs::exists(path)) {
+            res.status = 404;
+            res.set_content("missing", "text/plain");
+            return;
+        }
+        std::ifstream in(path, std::ios::binary);
+        std::ostringstream ss;
+        ss << in.rdbuf();
+        res.set_header("Cache-Control", "no-store");
+        res.set_content(ss.str(), "image/jpeg");
+    });
+
     server.Post("/place", [](const httplib::Request& req, httplib::Response& res) {
         try {
             auto j = json::parse(req.body);
@@ -705,17 +802,55 @@ static void setup_routes(httplib::Server& server) {
                 json_error(res, 400, "Bad place");
                 return;
             }
+            bool clearImage = false;
+            bool wroteImage = false;
+            long long imageTs = 0;
+            unsigned long long imageHash = 0;
+            if (j.contains("image") && j["image"].is_string()) {
+                auto bytes = decode64(j["image"].get<std::string>());
+                if (bytes.empty()) {
+                    clearImage = true;
+                } else if (bytes.size() > 500000) {
+                    json_error(res, 400, "Image too large");
+                    return;
+                } else {
+                    imageHash = image_hash(bytes);
+                    if (!write_place_image(groupId, id, bytes)) {
+                        json_error(res, 500, "Could not store photo");
+                        return;
+                    }
+                    wroteImage = true;
+                    imageTs = std::chrono::duration_cast<std::chrono::seconds>(
+                                  std::chrono::system_clock::now().time_since_epoch())
+                                  .count();
+                }
+            }
             {
                 std::lock_guard<std::mutex> lock(g_mu);
                 Place p;
+                auto old = g_places.find(key_of(groupId, id));
+                if (old != g_places.end()) p = old->second;
                 p.id = id;
                 p.groupId = groupId;
                 p.name = name;
                 p.lat = lat;
                 p.lon = lon;
                 p.radius = radius;
+                if (wroteImage) {
+                    p.hasImage = true;
+                    p.imageTs = imageTs;
+                    p.imageHash = imageHash;
+                } else if (clearImage) {
+                    p.hasImage = false;
+                    p.imageTs = 0;
+                    p.imageHash = 0;
+                }
                 g_places[key_of(groupId, id)] = p;
                 commit_locked();
+            }
+            if (clearImage) {
+                std::error_code ec;
+                fs::remove(place_image_path(groupId, id), ec);
             }
             json resp;
             resp["status"] = "saved";
@@ -739,6 +874,10 @@ static void setup_routes(httplib::Server& server) {
                 g_places.erase(key_of(groupId, id));
                 commit_locked();
             }
+            {
+                std::error_code ec;
+                fs::remove(place_image_path(groupId, id), ec);
+            }
             json resp;
             resp["status"] = "deleted";
             res.set_content(resp.dump(), "application/json");
@@ -756,6 +895,7 @@ static void setup_routes(httplib::Server& server) {
                 return;
             }
             std::vector<std::string> users;
+            std::vector<std::string> placeIds;
             {
                 std::lock_guard<std::mutex> lock(g_mu);
                 for (auto it = g_members.begin(); it != g_members.end();) {
@@ -767,14 +907,22 @@ static void setup_routes(httplib::Server& server) {
                     }
                 }
                 for (auto it = g_places.begin(); it != g_places.end();) {
-                    if (it->second.groupId == groupId) it = g_places.erase(it);
-                    else ++it;
+                    if (it->second.groupId == groupId) {
+                        placeIds.push_back(it->second.id);
+                        it = g_places.erase(it);
+                    } else {
+                        ++it;
+                    }
                 }
                 commit_locked();
             }
             for (const std::string& user : users) {
                 std::error_code ec;
                 fs::remove(avatar_path(groupId, user), ec);
+            }
+            for (const std::string& id : placeIds) {
+                std::error_code ec;
+                fs::remove(place_image_path(groupId, id), ec);
             }
             json resp;
             resp["status"] = "deleted";
@@ -901,9 +1049,9 @@ static void fill_lists() {
     }
     std::string sig;
     for (const Member& m : members) {
-        sig += m.groupId + m.userId + m.name + std::to_string(m.lat) + std::to_string(m.lon) + std::to_string(m.imageTs) + m.area + std::to_string(m.battery);
+        sig += m.groupId + m.userId + m.name + std::to_string(m.lat) + std::to_string(m.lon) + std::to_string(m.imageTs) + m.area + std::to_string(m.battery) + std::to_string(m.signal) + (m.locationOff ? "L" : "") + std::to_string(m.every) + std::to_string(m.ts);
     }
-    for (const Place& p : places) sig += p.id + p.name + std::to_string(p.lat) + std::to_string(p.lon) + std::to_string(p.radius);
+    for (const Place& p : places) sig += p.id + p.name + std::to_string(p.lat) + std::to_string(p.lon) + std::to_string(p.radius) + std::to_string(p.imageTs);
     bool changed = sig != g_list_sig;
     g_list_sig = sig;
     g_row_people = members;

@@ -19,4 +19,4 @@ jobs:
             FamilyLocationServer.exe \
             FamilyLocationServer-windows.zip \
             --title "Family location server ${GITHUB_REF_NAME#v}" \
-            --notes "Compiled Windows server. Drag a place to move it. With a place selected, the mouse wheel changes its radius. History is on each person instead of a window button."
+            --notes "Compiled Windows server. Stores signal strength, the expected check-in interval, location-off, and a photo for each place."

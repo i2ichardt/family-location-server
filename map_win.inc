@@ -766,20 +766,26 @@ static std::wstring ago_phrase(long long mins) {
 }
 
 static std::wstring stay_line(const Member& m) {
-    if (!m.hasLoc) return L"No location yet";
     long long now = static_cast<long long>(std::time(nullptr));
-    if (m.traveling) {
+    std::wstring base;
+    if (!m.hasLoc) base = L"No location yet";
+    else if (m.traveling) {
         int mph = static_cast<int>(m.speed * 2.23694 + 0.5);
         if (mph < 1) mph = 1;
         long long start = m.departed > 0 ? m.departed : m.ts;
         long long mins = now > start ? (now - start) / 60 : 0;
         std::wstring from = m.departedFrom.empty() ? L"this spot" : widen(m.departedFrom);
-        return L"Traveling at " + std::to_wstring(mph) + L" MPH · Departed from " + from + L" - " + ago_phrase(mins);
+        base = L"Traveling at " + std::to_wstring(mph) + L" MPH · Departed from " + from + L" - " + ago_phrase(mins);
+    } else {
+        long long start = m.arrived > 0 ? m.arrived : m.ts;
+        long long mins = now > start ? (now - start) / 60 : 0;
+        std::wstring where = m.area.empty() ? L"this spot" : widen(m.area);
+        base = L"Arrived to " + where + L" - " + ago_phrase(mins);
     }
-    long long start = m.arrived > 0 ? m.arrived : m.ts;
-    long long mins = now > start ? (now - start) / 60 : 0;
-    std::wstring where = m.area.empty() ? L"this spot" : widen(m.area);
-    return L"Arrived to " + where + L" - " + ago_phrase(mins);
+    if (m.locationOff) return base + L" · Location is off";
+    bool missed = m.every > 0 && m.ts > 0 && now > m.ts + static_cast<long long>(m.every * 1.5) + 20;
+    if (missed) return base + L" · No recent check-in";
+    return base;
 }
 
 static void remove_member(const std::string& group, const std::string& user) {
@@ -796,6 +802,8 @@ static void remove_place_id(const std::string& group, const std::string& id) {
     std::lock_guard<std::mutex> lock(g_mu);
     g_places.erase(key_of(group, id));
     commit_locked();
+    std::error_code ec;
+    fs::remove(place_image_path(group, id), ec);
 }
 
 static void remove_group_id(const std::string& group) {
@@ -1111,6 +1119,13 @@ static LRESULT CALLBACK roster_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (m.battery >= 0) {
                     if (!phone.empty()) phone += L"   ";
                     phone += L"Battery " + std::to_wstring(m.battery) + L"%";
+                }
+                if (m.signal >= 0) {
+                    if (!phone.empty()) phone += L"   ";
+                    phone += L"Signal " + std::to_wstring(m.signal) + L"/4";
+                } else if (m.signal <= -2) {
+                    if (!phone.empty()) phone += L"   ";
+                    phone += L"No signal";
                 }
                 if (!phone.empty()) {
                     Gdiplus::RectF phoneRect(16, static_cast<float>(y + 52), static_cast<float>(width - 32), 18);
