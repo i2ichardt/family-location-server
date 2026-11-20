@@ -19,4 +19,4 @@ jobs:
             FamilyLocationServer.exe \
             FamilyLocationServer-windows.zip \
             --title "Family location server ${GITHUB_REF_NAME#v}" \
-            --notes "Family location server 1.9. Drops bad fixes, keeps the last 50 records per person, asks phones if they are alive, and minimizes to the system tray."
+            --notes "Family location server 1.10. One program file. The C++ runtime is built in, so it does not need extra DLLs."
