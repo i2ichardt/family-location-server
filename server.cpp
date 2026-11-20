@@ -3,14 +3,16 @@
 // Plain HTTP, no password, as the test plan specified. Keep port 8000 off the public internet.
 //
 //   GET  /health
-//   POST /send      {userId, groupId, lat, lon, ts?}
+//   POST /send      {userId, groupId, lat, lon, ts?, acc?, prov?, wifi?, ssid?, alive?, speed?, ...}
 //   GET  /fetch?userId=&groupId=
 //   POST /profile   {userId, groupId, name, phone, image?}   image is base64 JPEG
 //   GET  /group?groupId=
 //   GET  /avatar?groupId=&userId=
-//   POST /place     {groupId, id, name, lat, lon, radius, image?}
+//   POST /place     {groupId, id, name, lat, lon, radius, image?, ssid?}
 //   GET  /placeimg?groupId=&id=
 //   POST /place/delete {groupId, id}
+//   GET  /servercfg
+//   POST /servercfg {historyKeep, aliveOn, aliveSecs}
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -68,6 +70,12 @@ struct Member {
     bool locationOff = false;
     int every = 0;
     unsigned long long imageHash = 0;
+    double acc = -1;
+    std::string prov;
+    bool wifi = false;
+    std::string ssid;
+    long long seen = 0;
+    long long acceptedAt = 0;
 };
 
 struct Place {
@@ -80,6 +88,7 @@ struct Place {
     bool hasImage = false;
     long long imageTs = 0;
     unsigned long long imageHash = 0;
+    std::string ssid;
 };
 
 struct CheckIn {
@@ -104,6 +113,21 @@ static std::map<std::string, Place> g_places;
 static httplib::Server* g_server = nullptr;
 static std::string g_status = "Starting";
 static fs::path g_root;
+static std::atomic<int> g_historyKeep{50};
+static std::atomic<bool> g_aliveOn{true};
+static std::atomic<int> g_aliveSecs{75};
+static std::string g_tail_saved;
+static std::mutex g_cfg_mu;
+
+static long long server_now() {
+    return static_cast<long long>(std::time(nullptr));
+}
+
+static int clamp_range(int v, int lo, int hi) {
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
 
 static std::string key_of(const std::string& group, const std::string& id) {
     return group + ":" + id;
@@ -224,6 +248,12 @@ static void save_locked() {
             {"locationOff", m.locationOff},
             {"every", m.every},
             {"imageHash", m.imageHash},
+            {"acc", m.acc},
+            {"prov", m.prov},
+            {"wifi", m.wifi},
+            {"ssid", m.ssid},
+            {"seen", m.seen},
+            {"acceptedAt", m.acceptedAt},
         });
     }
     json places = json::array();
@@ -239,6 +269,7 @@ static void save_locked() {
             {"hasImage", p.hasImage},
             {"imageTs", p.imageTs},
             {"imageHash", p.imageHash},
+            {"ssid", p.ssid},
         });
     }
     json root;
@@ -378,7 +409,33 @@ static void note_checkin_locked(const Member& m) {
     c.lon = m.lon;
     c.battery = m.battery;
     g_history.push_back(c);
-    if (g_history.size() > 800) g_history.erase(g_history.begin(), g_history.begin() + static_cast<long long>(g_history.size() - 800));
+}
+
+static void trim_history_locked() {
+    int limit = g_historyKeep.load();
+    if (limit < 10) limit = 10;
+    if (limit > 5000) limit = 5000;
+    std::map<std::string, int> count;
+    std::vector<char> keep(g_history.size(), 0);
+    for (int i = static_cast<int>(g_history.size()) - 1; i >= 0; --i) {
+        const CheckIn& c = g_history[static_cast<size_t>(i)];
+        std::string k = c.groupId + "\n" + c.userId;
+        int n = count[k];
+        if (n < limit) {
+            keep[static_cast<size_t>(i)] = 1;
+            count[k] = n + 1;
+        }
+    }
+    if (count.empty() && g_history.empty()) return;
+    size_t kept = 0;
+    for (char bit : keep) if (bit) kept++;
+    if (kept == g_history.size()) return;
+    std::vector<CheckIn> next;
+    next.reserve(kept);
+    for (size_t i = 0; i < g_history.size(); ++i) {
+        if (keep[i]) next.push_back(g_history[i]);
+    }
+    g_history.swap(next);
 }
 
 static void load_store() {
@@ -419,6 +476,12 @@ static void load_store() {
             m.locationOff = j.value("locationOff", false);
             m.every = j.value("every", 0);
             m.imageHash = j.value("imageHash", 0ULL);
+            m.acc = j.value("acc", -1.0);
+            m.prov = j.value("prov", "");
+            m.wifi = j.value("wifi", false);
+            m.ssid = j.value("ssid", "");
+            m.seen = j.value("seen", 0LL);
+            m.acceptedAt = j.value("acceptedAt", 0LL);
             g_members[key_of(m.groupId, m.userId)] = m;
         }
     }
@@ -435,10 +498,14 @@ static void load_store() {
             p.hasImage = j.value("hasImage", false);
             p.imageTs = j.value("imageTs", 0LL);
             p.imageHash = j.value("imageHash", 0ULL);
+            p.ssid = j.value("ssid", "");
             g_places[key_of(p.groupId, p.id)] = p;
         }
     }
     load_history();
+    size_t before = g_history.size();
+    trim_history_locked();
+    if (g_history.size() != before) save_history_locked();
 }
 
 static Member& ensure_member(const std::string& group, const std::string& user) {
@@ -460,6 +527,173 @@ static void json_error(httplib::Response& res, int code, const std::string& msg)
     res.set_content(j.dump(), "application/json");
 }
 
+static bool json_bool(const json& j, const char* key, bool fallback) {
+    if (!j.contains(key) || j[key].is_null()) return fallback;
+    if (j[key].is_boolean()) return j[key].get<bool>();
+    if (j[key].is_number()) return j[key].get<int>() != 0;
+    if (j[key].is_string()) {
+        std::string s = j[key].get<std::string>();
+        return s == "true" || s == "1";
+    }
+    return fallback;
+}
+
+static double place_radius(const Place& p) {
+    return p.radius < 20 ? 20 : p.radius;
+}
+
+static double leave_radius(const Place& p) {
+    double rad = place_radius(p);
+    double plus = rad + 40.0;
+    double scaled = rad * 1.35;
+    return plus > scaled ? plus : scaled;
+}
+
+static const Place* place_by_name_locked(const std::string& group, const std::string& name) {
+    if (name.empty()) return nullptr;
+    for (const auto& kv : g_places) {
+        if (kv.second.groupId == group && kv.second.name == name) return &kv.second;
+    }
+    return nullptr;
+}
+
+static const Place* place_inside_locked(const std::string& group, double lat, double lon) {
+    const Place* best = nullptr;
+    double bestR = 0;
+    for (const auto& kv : g_places) {
+        const Place& p = kv.second;
+        if (p.groupId != group) continue;
+        double rad = place_radius(p);
+        if (haversine_m(lat, lon, p.lat, p.lon) <= rad && (!best || rad < bestR)) {
+            best = &p;
+            bestR = rad;
+        }
+    }
+    return best;
+}
+
+static void apply_area_change_locked(Member& m, double lat, double lon, long long ts) {
+    const Place* current = place_by_name_locked(m.groupId, m.area);
+    std::string nxt;
+    if (current && haversine_m(lat, lon, current->lat, current->lon) <= leave_radius(*current)) {
+        nxt = current->name;
+    } else {
+        const Place* inside = place_inside_locked(m.groupId, lat, lon);
+        nxt = inside ? inside->name : "";
+    }
+    if (nxt == m.area) return;
+    if (!nxt.empty()) m.arrived = ts;
+    m.area = nxt;
+}
+
+static void remember_place_ssid_locked(const Member& m) {
+    if (!m.wifi || m.ssid.empty()) return;
+    Place* best = nullptr;
+    double bestR = 0;
+    for (auto& kv : g_places) {
+        Place& p = kv.second;
+        if (p.groupId != m.groupId || !p.ssid.empty()) continue;
+        double rad = place_radius(p);
+        if (haversine_m(m.lat, m.lon, p.lat, p.lon) <= rad && (!best || rad < bestR)) {
+            best = &p;
+            bestR = rad;
+        }
+    }
+    if (best) best->ssid = m.ssid;
+}
+
+static bool wifi_outside_place_locked(const std::string& group, const std::string& ssid, double lat, double lon) {
+    bool matched = false;
+    bool inside = false;
+    for (const auto& kv : g_places) {
+        const Place& p = kv.second;
+        if (p.groupId != group || p.ssid.empty() || p.ssid != ssid) continue;
+        matched = true;
+        if (haversine_m(lat, lon, p.lat, p.lon) <= place_radius(p)) inside = true;
+    }
+    return matched && !inside;
+}
+
+static void anchor_ref(const Member& m, double& lat, double& lon) {
+    lat = m.anchorLat;
+    lon = m.anchorLon;
+    if (m.hasLoc && lat == 0.0 && lon == 0.0 && (m.lat != 0.0 || m.lon != 0.0)) {
+        lat = m.lat;
+        lon = m.lon;
+    }
+}
+
+static void depart_locked(Member& m, long long ts) {
+    if (m.traveling) return;
+    m.traveling = true;
+    m.departed = ts;
+    m.departedFrom = m.area.empty() ? "this spot" : m.area;
+}
+
+static void load_server_cfg() {
+    fs::path path = g_root / "server.json";
+    if (!fs::exists(path)) return;
+    std::ifstream in(path);
+    if (!in) return;
+    json j;
+    try {
+        in >> j;
+    } catch (...) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_cfg_mu);
+    if (j.contains("tailscale") && j["tailscale"].is_string()) g_tail_saved = j["tailscale"].get<std::string>();
+    if (j.contains("historyKeep") && j["historyKeep"].is_number())
+        g_historyKeep.store(clamp_range(j["historyKeep"].get<int>(), 10, 5000));
+    if (j.contains("aliveOn")) {
+        if (j["aliveOn"].is_boolean()) g_aliveOn.store(j["aliveOn"].get<bool>());
+        else if (j["aliveOn"].is_number()) g_aliveOn.store(j["aliveOn"].get<int>() != 0);
+    }
+    if (j.contains("aliveSecs") && j["aliveSecs"].is_number())
+        g_aliveSecs.store(clamp_range(j["aliveSecs"].get<int>(), 20, 3600));
+}
+
+static void save_server_cfg() {
+    std::string tail;
+    int keep = g_historyKeep.load();
+    bool on = g_aliveOn.load();
+    int secs = g_aliveSecs.load();
+    {
+        std::lock_guard<std::mutex> lock(g_cfg_mu);
+        tail = g_tail_saved;
+        keep = g_historyKeep.load();
+        on = g_aliveOn.load();
+        secs = g_aliveSecs.load();
+    }
+    json j;
+    j["tailscale"] = tail;
+    j["historyKeep"] = keep;
+    j["aliveOn"] = on;
+    j["aliveSecs"] = secs;
+    std::error_code ec;
+    fs::create_directories(g_root, ec);
+    fs::path tmp = g_root / "server.json.tmp";
+    fs::path dest = g_root / "server.json";
+    {
+        std::ofstream out(tmp, std::ios::binary);
+        if (!out) return;
+        out << j.dump(2);
+    }
+    fs::rename(tmp, dest, ec);
+    if (ec) {
+        fs::remove(dest, ec);
+        fs::rename(tmp, dest, ec);
+    }
+}
+
+static json server_cfg_json() {
+    json j;
+    j["historyKeep"] = g_historyKeep.load();
+    j["aliveOn"] = g_aliveOn.load();
+    j["aliveSecs"] = g_aliveSecs.load();
+    return j;
+}
+
 static void setup_routes(httplib::Server& server) {
     server.set_payload_max_length(2 * 1024 * 1024);
 
@@ -470,13 +704,22 @@ static void setup_routes(httplib::Server& server) {
     server.Post("/send", [](const httplib::Request& req, httplib::Response& res) {
         try {
             auto j = json::parse(req.body);
-            bool locationOff = j.value("locationOff", false);
-            if (!j.contains("userId") || !j.contains("groupId") || (!locationOff && (!j.contains("lat") || !j.contains("lon")))) {
+            if (!j.contains("userId") || !j["userId"].is_string() || !j.contains("groupId") || !j["groupId"].is_string()) {
+                json_error(res, 400, "Missing fields");
+                return;
+            }
+            bool alive = json_bool(j, "alive", false);
+            bool locationOff = json_bool(j, "locationOff", false);
+            if (!alive && !locationOff && (!j.contains("lat") || !j.contains("lon"))) {
                 json_error(res, 400, "Missing fields");
                 return;
             }
             std::string userId = clip(j["userId"].get<std::string>(), 64);
             std::string groupId = clip(j["groupId"].get<std::string>(), 64);
+            if (userId.empty() || groupId.empty()) {
+                json_error(res, 400, "Bad location");
+                return;
+            }
             int signal = j.contains("signal") && j["signal"].is_number() ? j["signal"].get<int>() : -1;
             if (signal < -2) signal = -2;
             if (signal > 4) signal = 4;
@@ -484,12 +727,17 @@ static void setup_routes(httplib::Server& server) {
             if (every < 0) every = 0;
             if (every > 86400) every = 86400;
             long long ts = 0;
-            if (j.contains("ts")) ts = j["ts"].get<long long>();
-            if (ts <= 0) {
-                ts = std::chrono::duration_cast<std::chrono::seconds>(
-                         std::chrono::system_clock::now().time_since_epoch())
-                         .count();
-            }
+            if (j.contains("ts") && j["ts"].is_number()) ts = j["ts"].get<long long>();
+            if (ts <= 0) ts = server_now();
+            long long seen = server_now();
+            bool hasAcc = j.contains("acc") && j["acc"].is_number();
+            double acc = hasAcc ? j["acc"].get<double>() : -1;
+            if (hasAcc && (!std::isfinite(acc) || acc < 0)) hasAcc = false;
+            std::string prov = j.contains("prov") && j["prov"].is_string() ? clip(j["prov"].get<std::string>(), 32) : "";
+            bool hasWifi = j.contains("wifi");
+            bool wifi = hasWifi ? json_bool(j, "wifi", false) : false;
+            bool hasSsid = j.contains("ssid") && j["ssid"].is_string();
+            std::string ssid = hasSsid ? clip(j["ssid"].get<std::string>(), 64) : "";
             auto apply_status = [&](Member& m) {
                 if (j.contains("battery") && j["battery"].is_number()) {
                     int battery = j["battery"].get<int>();
@@ -497,90 +745,150 @@ static void setup_routes(httplib::Server& server) {
                 }
                 if (j.contains("signal")) m.signal = signal;
                 if (j.contains("every")) m.every = every;
+                if (hasWifi) m.wifi = wifi;
+                if (hasSsid) m.ssid = ssid;
+                m.seen = seen;
             };
+            auto saved = [&]() {
+                json resp;
+                resp["status"] = "saved";
+                res.set_content(resp.dump(), "application/json");
+            };
+            if (alive) {
+                std::lock_guard<std::mutex> lock(g_mu);
+                Member& m = ensure_member(groupId, userId);
+                apply_status(m);
+                if (j.contains("locationOff")) m.locationOff = locationOff;
+                commit_locked();
+                saved();
+                return;
+            }
             if (locationOff) {
-                if (userId.empty() || groupId.empty()) {
-                    json_error(res, 400, "Bad location");
-                    return;
-                }
                 std::lock_guard<std::mutex> lock(g_mu);
                 Member& m = ensure_member(groupId, userId);
                 apply_status(m);
                 m.locationOff = true;
                 m.ts = ts;
                 commit_locked();
-                json resp;
-                resp["status"] = "saved";
-                res.set_content(resp.dump(), "application/json");
+                saved();
                 return;
             }
             double lat = j["lat"].get<double>();
             double lon = j["lon"].get<double>();
-            if (userId.empty() || groupId.empty() || !valid_coord(lat, lon)) {
+            if (!valid_coord(lat, lon) || !std::isfinite(lat) || !std::isfinite(lon)) {
                 json_error(res, 400, "Bad location");
                 return;
             }
             bool hasSpeed = j.contains("speed") && j["speed"].is_number();
             double speed = hasSpeed ? j["speed"].get<double>() : 0;
+            if (hasSpeed && !std::isfinite(speed)) hasSpeed = false;
             {
                 std::lock_guard<std::mutex> lock(g_mu);
                 Member& m = ensure_member(groupId, userId);
                 apply_status(m);
                 m.locationOff = false;
-                const Place* here = nullptr;
-                for (const auto& kv : g_places) {
-                    const Place& p = kv.second;
-                    if (p.groupId != groupId) continue;
-                    double rad = p.radius < 20 ? 20 : p.radius;
-                    if (haversine_m(lat, lon, p.lat, p.lon) <= rad) {
-                        if (!here || rad < here->radius) here = &p;
+                bool reject = false;
+                if (m.hasLoc && m.acceptedAt > 0) {
+                    long long dt = seen - m.acceptedAt;
+                    if (dt >= 1 && dt <= 120) {
+                        double implied = haversine_m(m.lat, m.lon, lat, lon) / static_cast<double>(dt);
+                        if (implied > 70.0) reject = true;
                     }
                 }
-                std::string prevArea = m.area;
-                std::string nextArea = here ? here->name : "";
-                bool changedPlace = nextArea != prevArea;
-                auto mark_arrived = [&]() {
+                bool coarse = prov != "gps" && (!hasAcc || acc > 50.0);
+                bool recentGps = m.prov == "gps" && m.acceptedAt > 0 && seen - m.acceptedAt < 90;
+                if (coarse && recentGps) reject = true;
+                if (wifi && !ssid.empty() && wifi_outside_place_locked(groupId, ssid, lat, lon)) reject = true;
+                if (reject) {
+                    commit_locked();
+                    saved();
+                    return;
+                }
+                double aLat = 0, aLon = 0;
+                anchor_ref(m, aLat, aLon);
+                bool hasPrev = m.hasLoc;
+                double distAnchor = hasPrev ? haversine_m(aLat, aLon, lat, lon) : 0;
+                double distLast = hasPrev ? haversine_m(m.lat, m.lon, lat, lon) : 0;
+                double limit = m.traveling ? 0.6 : 1.2;
+                bool crawling = hasSpeed && speed < limit;
+                bool nearAnchor = !hasPrev || distAnchor < 35.0;
+                bool nearLast = !hasPrev || distLast < 35.0;
+                bool recordHistory = true;
+                auto snap_anchor = [&]() {
+                    if (m.anchorLat == 0.0 && m.anchorLon == 0.0) {
+                        m.anchorLat = aLat;
+                        m.anchorLon = aLon;
+                    }
+                    m.lat = m.anchorLat;
+                    m.lon = m.anchorLon;
                     m.traveling = false;
-                    m.arrived = ts;
+                };
+                if (hasSpeed && crawling && nearAnchor) {
+                    if (!hasPrev) {
+                        m.anchorLat = lat;
+                        m.anchorLon = lon;
+                        m.lat = lat;
+                        m.lon = lon;
+                        m.traveling = false;
+                        apply_area_change_locked(m, lat, lon, ts);
+                        if (m.arrived <= 0) m.arrived = ts;
+                    } else {
+                        snap_anchor();
+                        recordHistory = false;
+                    }
+                } else if (!hasSpeed && nearAnchor) {
+                    if (!hasPrev) {
+                        m.anchorLat = lat;
+                        m.anchorLon = lon;
+                        m.lat = lat;
+                        m.lon = lon;
+                        m.traveling = false;
+                        apply_area_change_locked(m, lat, lon, ts);
+                        if (m.arrived <= 0) m.arrived = ts;
+                    } else {
+                        snap_anchor();
+                        recordHistory = false;
+                    }
+                } else if (hasSpeed && m.traveling && speed < 0.6 && nearLast) {
+                    m.traveling = false;
                     m.anchorLat = lat;
                     m.anchorLon = lon;
-                };
-                if (hasSpeed) {
-                    bool crawling = m.traveling ? speed < 0.6 : speed < 1.2;
-                    bool still = !m.hasLoc || haversine_m(m.lat, m.lon, lat, lon) < 35.0;
-                    if (!crawling || !still) {
-                        if (!m.traveling) {
-                            m.traveling = true;
-                            m.departed = ts;
-                            m.departedFrom = prevArea.empty() ? "this spot" : prevArea;
-                        }
-                    } else if (m.traveling || changedPlace || m.arrived <= 0) {
-                        mark_arrived();
-                    }
-                    m.speed = speed;
+                    m.lat = lat;
+                    m.lon = lon;
+                    apply_area_change_locked(m, lat, lon, ts);
+                    if (m.area.empty()) m.arrived = ts;
                 } else {
-                    bool still = !m.hasLoc || haversine_m(m.lat, m.lon, lat, lon) < 35.0;
-                    if (!still) {
-                        if (!m.traveling) {
-                            m.traveling = true;
-                            m.departed = ts;
-                            m.departedFrom = prevArea.empty() ? "this spot" : prevArea;
-                        }
-                    } else if (m.traveling || changedPlace || m.arrived <= 0) {
-                        mark_arrived();
+                    if (!hasPrev) {
+                        m.anchorLat = lat;
+                        m.anchorLon = lon;
+                        m.lat = lat;
+                        m.lon = lon;
+                        m.traveling = true;
+                        m.departed = ts;
+                        m.departedFrom = "this spot";
+                        apply_area_change_locked(m, lat, lon, ts);
+                        if (m.arrived <= 0) m.arrived = ts;
+                    } else {
+                        depart_locked(m, ts);
+                        m.lat = lat;
+                        m.lon = lon;
+                        apply_area_change_locked(m, lat, lon, ts);
                     }
                 }
-                m.lat = lat;
-                m.lon = lon;
                 m.ts = ts;
                 m.hasLoc = true;
-                m.area = nextArea;
-                note_checkin_locked(m);
+                m.acceptedAt = seen;
+                m.acc = hasAcc ? acc : -1;
+                m.prov = prov;
+                if (hasSpeed) m.speed = speed;
+                remember_place_ssid_locked(m);
+                if (recordHistory) {
+                    note_checkin_locked(m);
+                    trim_history_locked();
+                }
                 commit_locked();
             }
-            json resp;
-            resp["status"] = "saved";
-            res.set_content(resp.dump(), "application/json");
+            saved();
         } catch (const std::exception& e) {
             json_error(res, 400, std::string("Invalid JSON: ") + e.what());
         }
@@ -691,6 +999,9 @@ static void setup_routes(httplib::Server& server) {
         }
         json members = json::array();
         json places = json::array();
+        long long nowS = server_now();
+        bool aliveOn = g_aliveOn.load();
+        int aliveSecs = g_aliveSecs.load();
         {
             std::lock_guard<std::mutex> lock(g_mu);
             for (const auto& kv : g_members) {
@@ -707,6 +1018,12 @@ static void setup_routes(httplib::Server& server) {
                 one["signal"] = m.signal;
                 one["locationOff"] = m.locationOff;
                 one["every"] = m.every;
+                one["acc"] = m.acc;
+                one["prov"] = m.prov;
+                one["wifi"] = m.wifi;
+                one["ssid"] = m.ssid;
+                one["seen"] = m.seen;
+                one["unreachable"] = aliveOn && m.seen > 0 && nowS > m.seen + static_cast<long long>(aliveSecs) + 25;
                 if (m.hasLoc) {
                     one["lat"] = m.lat;
                     one["lon"] = m.lon;
@@ -731,6 +1048,7 @@ static void setup_routes(httplib::Server& server) {
                     {"radius", p.radius},
                     {"hasImage", p.hasImage},
                     {"imageTs", p.imageTs},
+                    {"ssid", p.ssid},
                 });
             }
         }
@@ -738,6 +1056,7 @@ static void setup_routes(httplib::Server& server) {
         resp["groupId"] = groupId;
         resp["members"] = members;
         resp["places"] = places;
+        resp["aliveEvery"] = aliveOn ? aliveSecs : 0;
         {
             std::lock_guard<std::mutex> lock(g_wait_mu);
             resp["rev"] = g_rev;
@@ -836,6 +1155,7 @@ static void setup_routes(httplib::Server& server) {
                 p.lat = lat;
                 p.lon = lon;
                 p.radius = radius;
+                if (j.contains("ssid") && j["ssid"].is_string()) p.ssid = clip(j["ssid"].get<std::string>(), 64);
                 if (wroteImage) {
                     p.hasImage = true;
                     p.imageTs = imageTs;
@@ -932,6 +1252,61 @@ static void setup_routes(httplib::Server& server) {
         }
     });
 
+    server.Get("/servercfg", [](const httplib::Request&, httplib::Response& res) {
+        res.set_content(server_cfg_json().dump(), "application/json");
+    });
+
+    server.Post("/servercfg", [](const httplib::Request& req, httplib::Response& res) {
+        try {
+            auto j = json::parse(req.body);
+            int keep = g_historyKeep.load();
+            bool on = g_aliveOn.load();
+            int secs = g_aliveSecs.load();
+            if (j.contains("historyKeep")) {
+                if (!j["historyKeep"].is_number()) {
+                    json_error(res, 400, "historyKeep out of range");
+                    return;
+                }
+                keep = j["historyKeep"].get<int>();
+                if (keep < 10 || keep > 5000) {
+                    json_error(res, 400, "historyKeep out of range");
+                    return;
+                }
+            }
+            if (j.contains("aliveOn")) {
+                if (j["aliveOn"].is_boolean()) on = j["aliveOn"].get<bool>();
+                else if (j["aliveOn"].is_number()) on = j["aliveOn"].get<int>() != 0;
+                else {
+                    json_error(res, 400, "aliveOn");
+                    return;
+                }
+            }
+            if (j.contains("aliveSecs")) {
+                if (!j["aliveSecs"].is_number()) {
+                    json_error(res, 400, "aliveSecs out of range");
+                    return;
+                }
+                secs = j["aliveSecs"].get<int>();
+                if (secs < 20 || secs > 3600) {
+                    json_error(res, 400, "aliveSecs out of range");
+                    return;
+                }
+            }
+            g_historyKeep.store(keep);
+            g_aliveOn.store(on);
+            g_aliveSecs.store(secs);
+            save_server_cfg();
+            {
+                std::lock_guard<std::mutex> lock(g_mu);
+                trim_history_locked();
+                save_history_locked();
+            }
+            res.set_content(server_cfg_json().dump(), "application/json");
+        } catch (const std::exception& e) {
+            json_error(res, 400, std::string("Invalid JSON: ") + e.what());
+        }
+    });
+
     server.Get("/wait", [](const httplib::Request& req, httplib::Response& res) {
         long long since = 0;
         try {
@@ -968,6 +1343,7 @@ static fs::path exe_dir() {
 static void configure_data_dir() {
     g_root = exe_dir() / "data";
     fs::create_directories(g_root / "avatars");
+    load_server_cfg();
     load_store();
 }
 
@@ -975,14 +1351,10 @@ static void configure_data_dir() {
 
 static const int ID_LIST_PEOPLE = 100;
 static const int ID_LIST_PLACES = 101;
-static const int ID_STATUS = 102;
 static const int ID_OPEN = 103;
-static const int ID_NOTE = 104;
 static HWND g_hwnd = nullptr;
 static HWND g_people = nullptr;
 static HWND g_placeList = nullptr;
-static HWND g_statusLabel = nullptr;
-static HWND g_note = nullptr;
 static HFONT g_font = nullptr;
 
 static std::wstring widen(const std::string& s) {
@@ -1001,10 +1373,6 @@ static std::string stamp(long long ts) {
     char buf[32];
     std::strftime(buf, sizeof(buf), "%m-%d %H:%M", &tm);
     return buf;
-}
-
-static void set_text(HWND h, const std::wstring& s) {
-    SetWindowTextW(h, s.c_str());
 }
 
 static void add_column(HWND list, int i, const wchar_t* name, int w) {
@@ -1037,7 +1405,8 @@ static HWND make_list(HWND parent, int id, int x, int y, int w, int height);
 static void fill_lists() {
     refresh_address_labels();
     if (!g_live) {
-        set_text(g_statusLabel, widen(g_status) + L"    live updates paused");
+        if (g_roster) InvalidateRect(g_roster, nullptr, FALSE);
+        if (g_hwnd) InvalidateRect(g_hwnd, nullptr, FALSE);
         return;
     }
     std::vector<Member> members;
@@ -1049,18 +1418,18 @@ static void fill_lists() {
     }
     std::string sig;
     for (const Member& m : members) {
-        sig += m.groupId + m.userId + m.name + std::to_string(m.lat) + std::to_string(m.lon) + std::to_string(m.imageTs) + m.area + std::to_string(m.battery) + std::to_string(m.signal) + (m.locationOff ? "L" : "") + std::to_string(m.every) + std::to_string(m.ts);
+        sig += m.groupId + m.userId + m.name + std::to_string(m.lat) + std::to_string(m.lon) + std::to_string(m.imageTs) + m.area + std::to_string(m.battery) + std::to_string(m.signal) + (m.locationOff ? "L" : "") + (m.traveling ? "T" : "") + std::to_string(m.every) + std::to_string(m.ts);
     }
     for (const Place& p : places) sig += p.id + p.name + std::to_string(p.lat) + std::to_string(p.lon) + std::to_string(p.radius) + std::to_string(p.imageTs);
     bool changed = sig != g_list_sig;
     g_list_sig = sig;
     g_row_people = members;
     g_row_places = places;
-    int nPeople = static_cast<int>(members.size());
-    int nPlaces = static_cast<int>(places.size());
-    set_text(g_statusLabel, widen(g_status) + L"    " + std::to_wstring(nPeople) + L" people    " + std::to_wstring(nPlaces) + L" places");
+    g_n_people = static_cast<int>(members.size());
+    g_n_places = static_cast<int>(places.size());
     if (g_roster) InvalidateRect(g_roster, nullptr, FALSE);
     if (changed && g_map) InvalidateRect(g_map, nullptr, FALSE);
+    if (g_hwnd) InvalidateRect(g_hwnd, nullptr, FALSE);
 }
 
 static void stop_everything() {
@@ -1081,10 +1450,16 @@ static void open_data() {
 }
 
 struct SettingsState {
-    HWND edit = nullptr;
+    HWND tail = nullptr;
+    HWND keepEdit = nullptr;
+    HWND secsEdit = nullptr;
+    HWND aliveBox = nullptr;
     bool ok = false;
     bool done = false;
-    std::wstring value;
+    bool alive = true;
+    int keep = 50;
+    int secs = 75;
+    std::wstring tailText;
 };
 
 static LRESULT CALLBACK settings_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -1093,10 +1468,29 @@ static LRESULT CALLBACK settings_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_COMMAND:
         if (!st) break;
         if (LOWORD(wp) == 1) {
-            wchar_t buf[512];
-            buf[0] = 0;
-            if (st->edit) GetWindowTextW(st->edit, buf, 512);
-            st->value = buf;
+            wchar_t tail[512];
+            wchar_t keep[32];
+            wchar_t secs[32];
+            tail[0] = 0;
+            keep[0] = 0;
+            secs[0] = 0;
+            if (st->tail) GetWindowTextW(st->tail, tail, 512);
+            if (st->keepEdit) GetWindowTextW(st->keepEdit, keep, 32);
+            if (st->secsEdit) GetWindowTextW(st->secsEdit, secs, 32);
+            int keepN = _wtoi(keep);
+            int secsN = _wtoi(secs);
+            if (keepN < 10 || keepN > 5000) {
+                MessageBoxW(hwnd, L"History kept per person must be from 10 to 5000.", L"Settings", MB_OK | MB_ICONINFORMATION);
+                return 0;
+            }
+            if (secsN < 20 || secsN > 3600) {
+                MessageBoxW(hwnd, L"The alive check must be from 20 to 3600 seconds.", L"Settings", MB_OK | MB_ICONINFORMATION);
+                return 0;
+            }
+            st->keep = keepN;
+            st->secs = secsN;
+            st->alive = st->aliveBox && SendMessageW(st->aliveBox, BM_GETCHECK, 0, 0) == BST_CHECKED;
+            st->tailText = tail;
             st->ok = true;
             st->done = true;
             DestroyWindow(hwnd);
@@ -1129,24 +1523,35 @@ static void open_settings(HWND owner) {
         registered = true;
     }
     SettingsState st;
-    st.value = widen(g_tail_saved);
+    st.keep = g_historyKeep.load();
+    st.secs = g_aliveSecs.load();
+    st.alive = g_aliveOn.load();
+    {
+        std::lock_guard<std::mutex> lock(g_cfg_mu);
+        st.tailText = widen(g_tail_saved);
+    }
     HWND hwnd = CreateWindowExW(WS_EX_DLGMODALFRAME, L"FamilySettings", L"Settings",
-        WS_POPUP | WS_CAPTION | WS_SYSMENU, CW_USEDEFAULT, CW_USEDEFAULT, 480, 210,
+        WS_POPUP | WS_CAPTION | WS_SYSMENU, CW_USEDEFAULT, CW_USEDEFAULT, 520, 420,
         owner, nullptr, GetModuleHandleW(nullptr), nullptr);
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&st));
-    HWND title = CreateWindowExW(0, L"STATIC", L"Saved Tailscale address", WS_CHILD | WS_VISIBLE, 16, 14, 440, 18, hwnd, nullptr, nullptr, nullptr);
-    HWND hint = CreateWindowExW(0, L"STATIC", L"Phones away from home use this. Include http:// and :8000.", WS_CHILD | WS_VISIBLE, 16, 36, 440, 18, hwnd, nullptr, nullptr, nullptr);
-    st.edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", st.value.c_str(), WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 16, 62, 440, 26, hwnd, nullptr, nullptr, nullptr);
-    HWND save = CreateWindowExW(0, L"BUTTON", L"Save", WS_CHILD | WS_VISIBLE | WS_TABSTOP, 248, 108, 96, 28, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(1)), nullptr, nullptr);
-    HWND cancel = CreateWindowExW(0, L"BUTTON", L"Cancel", WS_CHILD | WS_VISIBLE | WS_TABSTOP, 356, 108, 96, 28, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(2)), nullptr, nullptr);
-    SendMessageW(title, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
-    SendMessageW(hint, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
-    SendMessageW(st.edit, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
-    SendMessageW(save, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
-    SendMessageW(cancel, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
+    CreateWindowExW(0, L"STATIC", L"Saved Tailscale address", WS_CHILD | WS_VISIBLE, 16, 14, 470, 18, hwnd, nullptr, nullptr, nullptr);
+    CreateWindowExW(0, L"STATIC", L"Phones away from home use this. Include http:// and :8000.", WS_CHILD | WS_VISIBLE, 16, 34, 470, 18, hwnd, nullptr, nullptr, nullptr);
+    st.tail = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", st.tailText.c_str(), WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 16, 56, 476, 26, hwnd, nullptr, nullptr, nullptr);
+    CreateWindowExW(0, L"STATIC", L"Location history kept per person (10 to 5000)", WS_CHILD | WS_VISIBLE, 16, 96, 470, 18, hwnd, nullptr, nullptr, nullptr);
+    st.keepEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", std::to_wstring(st.keep).c_str(), WS_CHILD | WS_VISIBLE | ES_NUMBER, 16, 118, 160, 26, hwnd, nullptr, nullptr, nullptr);
+    st.aliveBox = CreateWindowExW(0, L"BUTTON", L"Ask phones if they are reachable", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 16, 160, 360, 24, hwnd, nullptr, nullptr, nullptr);
+    SendMessageW(st.aliveBox, BM_SETCHECK, st.alive ? BST_CHECKED : BST_UNCHECKED, 0);
+    CreateWindowExW(0, L"STATIC", L"Seconds between alive checks (20 to 3600)", WS_CHILD | WS_VISIBLE, 16, 196, 470, 18, hwnd, nullptr, nullptr, nullptr);
+    st.secsEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", std::to_wstring(st.secs).c_str(), WS_CHILD | WS_VISIBLE | ES_NUMBER, 16, 218, 160, 26, hwnd, nullptr, nullptr, nullptr);
+    CreateWindowExW(0, L"BUTTON", L"Save", WS_CHILD | WS_VISIBLE | WS_TABSTOP, 280, 330, 96, 30, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(1)), nullptr, nullptr);
+    CreateWindowExW(0, L"BUTTON", L"Cancel", WS_CHILD | WS_VISIBLE | WS_TABSTOP, 388, 330, 96, 30, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(2)), nullptr, nullptr);
+    EnumChildWindows(hwnd, [](HWND child, LPARAM font) -> BOOL {
+        SendMessageW(child, WM_SETFONT, static_cast<WPARAM>(font), TRUE);
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(g_font));
     EnableWindow(owner, FALSE);
     ShowWindow(hwnd, SW_SHOW);
-    SetForegroundWindow(st.edit);
+    SetForegroundWindow(st.tail);
     MSG msg;
     while (!st.done && GetMessageW(&msg, nullptr, 0, 0) > 0) {
         if (!IsDialogMessageW(hwnd, &msg)) {
@@ -1156,7 +1561,17 @@ static void open_settings(HWND owner) {
     }
     EnableWindow(owner, TRUE);
     SetForegroundWindow(owner);
-    if (st.ok) save_tail_text(st.value);
+    if (!st.ok) return;
+    g_historyKeep.store(st.keep);
+    g_aliveOn.store(st.alive);
+    g_aliveSecs.store(st.secs);
+    save_tail_text(st.tailText);
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        trim_history_locked();
+        save_history_locked();
+    }
+    fill_lists();
 }
 
 static void layout_main(HWND hwnd) {
@@ -1166,23 +1581,27 @@ static void layout_main(HWND hwnd) {
     int h = rc.bottom;
     if (w < 80 || h < 80) return;
     const int margin = 16;
-    if (g_homeLabel) MoveWindow(g_homeLabel, margin, 10, w - margin * 2, 22, TRUE);
-    if (g_tailLive) MoveWindow(g_tailLive, margin, 34, w - margin * 2, 22, TRUE);
-    int top = 66;
-    int content = h - top - 56;
+    const int header = 86;
+    const int footer = 56;
+    int top = header + 12;
+    int content = h - top - footer - 8;
     if (content < 80) content = 80;
     int rosterW = w / 3;
-    if (rosterW < 280) rosterW = 280;
-    if (rosterW > 460) rosterW = 460;
+    if (rosterW < 300) rosterW = 300;
+    if (rosterW > 440) rosterW = 440;
     int mapW = w - margin * 3 - rosterW;
     if (mapW < 180) {
         mapW = (w - margin * 3) / 2;
         rosterW = w - margin * 3 - mapW;
+        if (rosterW < 160) rosterW = 160;
+        mapW = w - margin * 3 - rosterW;
+        if (mapW < 80) mapW = 80;
     }
-    if (g_map) MoveWindow(g_map, margin, top, mapW, content, TRUE);
+    if (g_map) {
+        MoveWindow(g_map, margin, top, mapW, content, TRUE);
+        round_child(g_map, 16);
+    }
     if (g_roster) MoveWindow(g_roster, margin + mapW + margin, top, rosterW, content, TRUE);
-    if (g_statusLabel) MoveWindow(g_statusLabel, margin, top + content + 8, w - margin * 2, 18, TRUE);
-    if (g_note) MoveWindow(g_note, margin, top + content + 28, w - margin * 2, 22, TRUE);
 }
 
 static void sync_menu(HWND hwnd) {
@@ -1192,13 +1611,62 @@ static void sync_menu(HWND hwnd) {
     CheckMenuItem(bar, 125, MF_BYCOMMAND | (!g_live ? MF_CHECKED : MF_UNCHECKED));
 }
 
+static const UINT WM_TRAYICON = WM_APP + 21;
+static NOTIFYICONDATAW g_nid{};
+static bool g_tray_on = false;
+static bool g_hiding_to_tray = false;
+
+static void remove_tray() {
+    if (!g_tray_on) return;
+    Shell_NotifyIconW(NIM_DELETE, &g_nid);
+    g_tray_on = false;
+}
+
+static void add_tray(HWND hwnd) {
+    if (g_tray_on) return;
+    NOTIFYICONDATAW nid{};
+    nid.cbSize = sizeof(nid);
+    nid.hWnd = hwnd;
+    nid.uID = 1;
+    nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    nid.uCallbackMessage = WM_TRAYICON;
+    nid.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
+    lstrcpynW(nid.szTip, L"Family Location Server", static_cast<int>(sizeof(nid.szTip) / sizeof(nid.szTip[0])));
+    if (Shell_NotifyIconW(NIM_ADD, &nid)) {
+        g_nid = nid;
+        g_tray_on = true;
+    }
+}
+
+static void show_from_tray(HWND hwnd) {
+    ShowWindow(hwnd, SW_SHOW);
+    ShowWindow(hwnd, SW_RESTORE);
+    SetForegroundWindow(hwnd);
+    remove_tray();
+}
+
 static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    try {
     switch (msg) {
     case WM_CREATE:
         return 0;
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PAINT:
+        paint_shell(hwnd);
+        return 0;
     case WM_SIZE:
-        if (wp != SIZE_MINIMIZED) layout_main(hwnd);
-        return DefWindowProcW(hwnd, msg, wp, lp);
+        if (wp == SIZE_MINIMIZED) {
+            if (!g_hiding_to_tray) {
+                g_hiding_to_tray = true;
+                ShowWindow(hwnd, SW_HIDE);
+                add_tray(hwnd);
+                g_hiding_to_tray = false;
+            }
+            return 0;
+        }
+        layout_main(hwnd);
+        return 0;
     case WM_SYSCOMMAND:
         if ((wp & 0xFFF0) == SC_CLOSE) {
             DestroyWindow(hwnd);
@@ -1211,9 +1679,25 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_INITMENUPOPUP:
         sync_menu(hwnd);
         return 0;
+    case WM_TRAYICON:
+        if (lp == WM_LBUTTONUP || lp == WM_LBUTTONDBLCLK) {
+            show_from_tray(hwnd);
+        } else if (lp == WM_RBUTTONUP || lp == WM_CONTEXTMENU) {
+            HMENU menu = CreatePopupMenu();
+            AppendMenuW(menu, MF_STRING, 310, L"Open");
+            AppendMenuW(menu, MF_STRING, 201, L"Exit");
+            POINT pt{};
+            GetCursorPos(&pt);
+            SetForegroundWindow(hwnd);
+            TrackPopupMenu(menu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, nullptr);
+            DestroyMenu(menu);
+            PostMessageW(hwnd, WM_NULL, 0, 0);
+        }
+        return 0;
     case WM_COMMAND:
         if (LOWORD(wp) == ID_OPEN) open_data();
         if (LOWORD(wp) == 200) open_settings(hwnd);
+        if (LOWORD(wp) == 310) show_from_tray(hwnd);
         if (LOWORD(wp) == 201) DestroyWindow(hwnd);
         if (LOWORD(wp) == 211) open_checkin_db(hwnd);
         if (LOWORD(wp) == 121) {
@@ -1231,6 +1715,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         fill_lists();
         return 0;
     case WM_DESTROY:
+        remove_tray();
         KillTimer(hwnd, 1);
         stop_everything();
         PostQuitMessage(0);
@@ -1239,18 +1724,9 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     default:
         return DefWindowProcW(hwnd, msg, wp, lp);
     }
-}
-
-static HWND make_label(HWND parent, const wchar_t* text, int x, int y, int w, int height, int id) {
-    HWND hwnd = CreateWindowExW(0, L"STATIC", text, WS_CHILD | WS_VISIBLE, x, y, w, height, parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), nullptr, nullptr);
-    SendMessageW(hwnd, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
-    return hwnd;
-}
-
-static HWND make_button(HWND parent, const wchar_t* text, int x, int y, int w, int height, int id) {
-    HWND hwnd = CreateWindowExW(0, L"BUTTON", text, WS_CHILD | WS_VISIBLE | WS_TABSTOP, x, y, w, height, parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), nullptr, nullptr);
-    SendMessageW(hwnd, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
-    return hwnd;
+    } catch (...) {
+        return 0;
+    }
 }
 
 static HWND make_list(HWND parent, int id, int x, int y, int w, int height) {
@@ -1267,19 +1743,21 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int show) {
 
     INITCOMMONCONTROLSEX icc{sizeof(icc), ICC_LISTVIEW_CLASSES};
     InitCommonControlsEx(&icc);
-    g_font = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+    HFONT ui = CreateFontW(-16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+        OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+    g_font = ui ? ui : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
 
     WNDCLASSW wc{};
     wc.lpfnWndProc = wnd_proc;
     wc.hInstance = inst;
     wc.lpszClassName = L"FamilyLocationServer";
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+    wc.hbrBackground = nullptr;
     wc.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
     RegisterClassW(&wc);
 
-    g_hwnd = CreateWindowExW(0, wc.lpszClassName, L"Family location server",
-        WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 1200, 820,
+    g_hwnd = CreateWindowExW(0, wc.lpszClassName, L"Family Location Server",
+        WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT, 1280, 860,
         nullptr, nullptr, inst, nullptr);
 
     Gdiplus::GdiplusStartupInput gdip_in;
@@ -1300,16 +1778,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int show) {
     AppendMenuW(bar, MF_POPUP, reinterpret_cast<UINT_PTR>(view), L"View");
     SetMenu(g_hwnd, bar);
 
-    g_homeLabel = make_label(g_hwnd, L"Home", 16, 8, 400, 20, 0);
-    g_tailLive = make_label(g_hwnd, L"Tailscale", 16, 30, 400, 20, 0);
-
     create_map(g_hwnd);
     create_roster(g_hwnd);
-
-    g_statusLabel = make_label(g_hwnd, L"Starting", 16, 610, 400, 20, ID_STATUS);
-    g_note = make_label(g_hwnd,
-        L"Drag a place on the map to move it. Scroll the wheel while it is selected to change its arrive and leave distance. History is on each person.",
-        16, 636, 400, 22, ID_NOTE);
 
     g_server = new httplib::Server();
     setup_routes(*g_server);
@@ -1318,11 +1788,11 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int show) {
             g_status = "Port 8000 is already in use";
         }
     }).detach();
-    g_status = "Listening on port 8000  (LAN and Tailscale)";
+    g_status = "Listening on port 8000";
 
+    fill_lists();
     ShowWindow(g_hwnd, show);
     SetTimer(g_hwnd, 1, 1000, nullptr);
-    fill_lists();
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {

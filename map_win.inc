@@ -6,14 +6,16 @@ typedef ULONG PROPID;
 #endif
 #include <gdiplus.h>
 #include <iphlpapi.h>
-#include <queue>
+#include <deque>
 #include <set>
 #include <winhttp.h>
 #include <windowsx.h>
 
-static HWND g_homeLabel = nullptr;
-static HWND g_tailLive = nullptr;
 static HWND g_map = nullptr;
+static std::string g_home_line = "Home LAN:";
+static std::string g_tail_line = "Tailscale:";
+static int g_n_people = 0;
+static int g_n_places = 0;
 static std::vector<Member> g_row_people;
 static std::vector<Place> g_row_places;
 static bool g_live = true;
@@ -21,9 +23,32 @@ static std::string g_list_sig;
 static HWND g_roster = nullptr;
 static HWND g_historyBtn = nullptr;
 static void open_history(HWND owner, const std::string& group, const std::string& user, const std::string& name);
-static std::string g_tail_saved;
 static bool g_tail_seeded = false;
 static bool g_satellite = false;
+
+static void fill_round_rect(Gdiplus::Graphics& g, const Gdiplus::Brush& brush, float x, float y, float w, float h, float r) {
+    if (w < 1 || h < 1) return;
+    if (r < 1) r = 1;
+    if (r * 2 > w) r = w / 2;
+    if (r * 2 > h) r = h / 2;
+    Gdiplus::GraphicsPath path;
+    float d = r * 2;
+    path.AddArc(x, y, d, d, 180, 90);
+    path.AddArc(x + w - d, y, d, d, 270, 90);
+    path.AddArc(x + w - d, y + h - d, d, d, 0, 90);
+    path.AddArc(x, y + h - d, d, d, 90, 90);
+    path.CloseFigure();
+    g.FillPath(&brush, &path);
+}
+
+static void round_child(HWND hwnd, int radius) {
+    if (!hwnd) return;
+    RECT rc{};
+    GetClientRect(hwnd, &rc);
+    if (rc.right < 2 || rc.bottom < 2) return;
+    HRGN rgn = CreateRoundRectRgn(0, 0, rc.right + 1, rc.bottom + 1, radius, radius);
+    SetWindowRgn(hwnd, rgn, TRUE);
+}
 
 static std::string narrow_w(const std::wstring& w) {
     if (w.empty()) return "";
@@ -66,63 +91,63 @@ static void collect_ips(std::vector<std::string>& home, std::vector<std::string>
 }
 
 static void load_tail_setting() {
-    fs::path path = g_root / "server.json";
-    if (!fs::exists(path)) return;
-    std::ifstream in(path);
-    json j;
-    try {
-        in >> j;
-    } catch (...) {
-        return;
-    }
-    g_tail_saved = j.value("tailscale", "");
+    load_server_cfg();
 }
 
 static void save_tail_setting() {
-    json j;
-    j["tailscale"] = g_tail_saved;
-    std::ofstream out(g_root / "server.json", std::ios::binary);
-    out << j.dump(2);
+    save_server_cfg();
 }
 
 static void refresh_address_labels() {
     std::vector<std::string> home, tail;
     collect_ips(home, tail);
-    std::string home_text = "Home  ";
-    if (home.empty()) home_text += "no LAN address yet. Check Wi-Fi, then use http://<that address>:8000";
+    std::string home_text = "Home LAN:  ";
+    if (home.empty()) home_text += "no LAN address yet";
     else {
         for (size_t i = 0; i < home.size(); i++) {
             if (i) home_text += "    ";
             home_text += "http://" + home[i] + ":8000";
         }
     }
-    std::string tail_text = "Tailscale on this PC  ";
-    if (tail.empty()) tail_text += "not detected. Set the phone address in File, then Settings.";
+    std::string saved;
+    {
+        std::lock_guard<std::mutex> lock(g_cfg_mu);
+        saved = g_tail_saved;
+    }
+    std::string tail_text = "Tailscale:  ";
+    if (tail.empty()) tail_text += saved.empty() ? "not detected" : saved;
     else {
         for (size_t i = 0; i < tail.size(); i++) {
             if (i) tail_text += "    ";
             tail_text += "http://" + tail[i] + ":8000";
         }
     }
-    if (g_homeLabel) set_text(g_homeLabel, widen(home_text));
-    if (g_tailLive) set_text(g_tailLive, widen(tail_text));
+    g_home_line = home_text;
+    g_tail_line = tail_text;
     if (!g_tail_seeded) {
         g_tail_seeded = true;
-        if (g_tail_saved.empty() && !tail.empty()) {
-            g_tail_saved = "http://" + tail[0] + ":8000";
+        if (saved.empty() && !tail.empty()) {
+            {
+                std::lock_guard<std::mutex> lock(g_cfg_mu);
+                g_tail_saved = "http://" + tail[0] + ":8000";
+            }
             save_tail_setting();
         }
     }
 }
 
 static void save_tail_text(const std::wstring& raw) {
-    g_tail_saved = narrow_w(raw);
-    while (!g_tail_saved.empty() && (g_tail_saved.back() == ' ' || g_tail_saved.back() == '/')) g_tail_saved.pop_back();
+    std::string text = narrow_w(raw);
+    while (!text.empty() && (text.back() == ' ' || text.back() == '/')) text.pop_back();
     size_t start = 0;
-    while (start < g_tail_saved.size() && g_tail_saved[start] == ' ') start++;
-    if (start > 0) g_tail_saved.erase(0, start);
-    if (!g_tail_saved.empty() && g_tail_saved.rfind("http://", 0) != 0 && g_tail_saved.rfind("https://", 0) != 0)
-        g_tail_saved = "http://" + g_tail_saved;
+    while (start < text.size() && text[start] == ' ') start++;
+    if (start > 0) text.erase(0, start);
+    if (!text.empty() && text.rfind("http://", 0) != 0 && text.rfind("https://", 0) != 0)
+        text = "http://" + text;
+    {
+        std::lock_guard<std::mutex> lock(g_cfg_mu);
+        g_tail_saved = text;
+    }
     save_tail_setting();
 }
 
@@ -209,7 +234,7 @@ struct MapState {
     std::set<std::string> pending;
 };
 static MapState g_map_state;
-static std::queue<std::string> g_tile_jobs;
+static std::deque<std::string> g_tile_jobs;
 static std::mutex g_job_mu;
 static std::condition_variable g_job_cv;
 static bool g_tile_quit = false;
@@ -265,6 +290,15 @@ static std::vector<unsigned char> https_get(const std::wstring& host, const std:
     return out;
 }
 
+static int tile_rank(const std::string& key, int cz, int cx, int cy) {
+    int sat = 0, z = 0, x = 0, y = 0;
+    if (std::sscanf(key.c_str(), "%d/%d/%d/%d", &sat, &z, &x, &y) != 4) return 100000000;
+    if (z != cz) return 50000000 + std::abs(z - cz) * 100000;
+    int dx = x - cx;
+    int dy = y - cy;
+    return dx * dx + dy * dy;
+}
+
 static void tile_worker() {
     while (true) {
         std::string key;
@@ -273,7 +307,7 @@ static void tile_worker() {
             g_job_cv.wait(lock, [] { return g_tile_quit || !g_tile_jobs.empty(); });
             if (g_tile_quit && g_tile_jobs.empty()) return;
             key = g_tile_jobs.front();
-            g_tile_jobs.pop();
+            g_tile_jobs.pop_front();
         }
         int sat = 0, z = 0, x = 0, y = 0;
         if (std::sscanf(key.c_str(), "%d/%d/%d/%d", &sat, &z, &x, &y) != 4) continue;
@@ -287,24 +321,68 @@ static void tile_worker() {
             std::swprintf(path, 256, L"/%d/%d/%d.png", z, x, y);
         }
         auto bytes = https_get(host, path);
-        if (bytes.size() < 32 || !g_map) continue;
+        auto drop_pending = [&]() {
+            std::lock_guard<std::mutex> lock(g_map_state.mu);
+            g_map_state.pending.erase(key);
+        };
+        if (bytes.size() < 32 || !g_map) {
+            drop_pending();
+            continue;
+        }
         auto* msg = new std::pair<std::string, std::vector<unsigned char>>(key, std::move(bytes));
-        if (!PostMessageW(g_map, WM_TILE, 0, reinterpret_cast<LPARAM>(msg))) delete msg;
+        if (!PostMessageW(g_map, WM_TILE, 0, reinterpret_cast<LPARAM>(msg))) {
+            delete msg;
+            drop_pending();
+        }
     }
 }
 
-static void want_tile(const std::string& key) {
+static void want_tile(const std::string& key, bool front) {
     {
         std::lock_guard<std::mutex> lock(g_map_state.mu);
         if (g_map_state.tiles.count(key) || g_map_state.pending.count(key)) return;
-        if (g_map_state.pending.size() > 40) return;
         g_map_state.pending.insert(key);
     }
+    std::vector<std::string> dropped;
     {
         std::lock_guard<std::mutex> lock(g_job_mu);
-        g_tile_jobs.push(key);
+        if (front) g_tile_jobs.push_front(key);
+        else g_tile_jobs.push_back(key);
+        const size_t cap = 80;
+        if (g_tile_jobs.size() > cap) {
+            double px = 0, py = 0;
+            int z = g_map_state.zoom;
+            project_xy(g_map_state.lat, g_map_state.lon, z, px, py);
+            int cx = static_cast<int>(std::floor(px / 256.0));
+            int cy = static_cast<int>(std::floor(py / 256.0));
+            while (g_tile_jobs.size() > cap) {
+                size_t worst = 0;
+                int worstD = -1;
+                for (size_t i = 0; i < g_tile_jobs.size(); i++) {
+                    int d = tile_rank(g_tile_jobs[i], z, cx, cy);
+                    if (d > worstD) {
+                        worstD = d;
+                        worst = i;
+                    }
+                }
+                dropped.push_back(g_tile_jobs[worst]);
+                g_tile_jobs.erase(g_tile_jobs.begin() + static_cast<std::deque<std::string>::difference_type>(worst));
+            }
+        }
+    }
+    if (!dropped.empty()) {
+        std::lock_guard<std::mutex> lock(g_map_state.mu);
+        for (const std::string& k : dropped) g_map_state.pending.erase(k);
     }
     g_job_cv.notify_one();
+}
+
+static void queue_tile_xy(int zoom, int tx, int ty, bool front) {
+    if (zoom < 0 || zoom > 22) return;
+    int max_i = (1 << zoom) - 1;
+    if (tx < 0 || ty < 0 || tx > max_i || ty > max_i) return;
+    std::string key = std::to_string(g_satellite ? 1 : 0) + "/" + std::to_string(zoom) + "/" + std::to_string(tx) + "/" + std::to_string(ty);
+    want_tile(key, front);
 }
 
 static void remember_tile(const std::string& key, const std::vector<unsigned char>& bytes) {
@@ -331,14 +409,28 @@ static void remember_tile(const std::string& key, const std::vector<unsigned cha
         stream->Release();
         return;
     }
-    if (g_map_state.tiles.size() > 160) {
-        for (auto& kv : g_map_state.tiles) {
-            delete kv.second.second;
-            if (kv.second.first) kv.second.first->Release();
-        }
-        g_map_state.tiles.clear();
-    }
     g_map_state.tiles[key] = {stream, bmp};
+    if (g_map_state.tiles.size() > 240) {
+        double px = 0, py = 0;
+        int z = g_map_state.zoom;
+        project_xy(g_map_state.lat, g_map_state.lon, z, px, py);
+        int cx = static_cast<int>(std::floor(px / 256.0));
+        int cy = static_cast<int>(std::floor(py / 256.0));
+        std::vector<std::pair<int, std::string>> rank;
+        rank.reserve(g_map_state.tiles.size());
+        for (const auto& kv : g_map_state.tiles) rank.push_back({tile_rank(kv.first, z, cx, cy), kv.first});
+        std::sort(rank.begin(), rank.end(), [](const std::pair<int, std::string>& a, const std::pair<int, std::string>& b) {
+            return a.first > b.first;
+        });
+        size_t extra = g_map_state.tiles.size() > 180 ? g_map_state.tiles.size() - 180 : 0;
+        for (size_t i = 0; i < extra && i < rank.size(); i++) {
+            auto it = g_map_state.tiles.find(rank[i].second);
+            if (it == g_map_state.tiles.end()) continue;
+            delete it->second.second;
+            if (it->second.first) it->second.first->Release();
+            g_map_state.tiles.erase(it);
+        }
+    }
 }
 
 static std::map<std::string, Gdiplus::Bitmap*> g_faces;
@@ -389,6 +481,47 @@ static Gdiplus::Bitmap* face_bitmap(const Member& m) {
     g_faces[key] = loaded;
     g_face_stamp[key] = m.imageTs;
     return loaded;
+}
+
+static std::map<std::string, Gdiplus::Bitmap*> g_place_imgs;
+static std::map<std::string, long long> g_place_stamp;
+
+static Gdiplus::Bitmap* place_bitmap(const Place& p) {
+    if (!p.hasImage) return nullptr;
+    std::string key = p.groupId + ":" + p.id;
+    auto have = g_place_stamp.find(key);
+    auto bmp = g_place_imgs.find(key);
+    if (have != g_place_stamp.end() && have->second == p.imageTs && bmp != g_place_imgs.end()) return bmp->second;
+    fs::path path = place_image_path(p.groupId, p.id);
+    if (!fs::exists(path)) return nullptr;
+    Gdiplus::Bitmap* loaded = bitmap_from_file(path);
+    if (!loaded) return nullptr;
+    if (bmp != g_place_imgs.end() && bmp->second) delete bmp->second;
+    g_place_imgs[key] = loaded;
+    g_place_stamp[key] = p.imageTs;
+    return loaded;
+}
+
+static void draw_house_icon(Gdiplus::Graphics& g, float x, float y, float s) {
+    Gdiplus::SolidBrush bg(Gdiplus::Color(255, 219, 234, 254));
+    fill_round_rect(g, bg, x, y, s, s, 10);
+    Gdiplus::SolidBrush ink(Gdiplus::Color(255, 29, 78, 216));
+    Gdiplus::PointF roof[3] = {
+        Gdiplus::PointF(x + s * 0.50f, y + s * 0.18f),
+        Gdiplus::PointF(x + s * 0.78f, y + s * 0.46f),
+        Gdiplus::PointF(x + s * 0.22f, y + s * 0.46f),
+    };
+    g.FillPolygon(&ink, roof, 3);
+    g.FillRectangle(&ink, x + s * 0.32f, y + s * 0.46f, s * 0.36f, s * 0.30f);
+}
+
+static void center_on(double lat, double lon) {
+    if (!valid_coord(lat, lon)) return;
+    g_map_state.lat = lat;
+    g_map_state.lon = lon;
+    g_map_state.moved = true;
+    if (g_map_state.zoom < 16) g_map_state.zoom = 16;
+    if (g_map) InvalidateRect(g_map, nullptr, FALSE);
 }
 
 static std::string g_sel_group;
@@ -457,6 +590,7 @@ static bool selected_place(Place& out) {
 }
 
 static LRESULT CALLBACK map_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    try {
     switch (msg) {
     case WM_LBUTTONDOWN: {
         int x = GET_X_LPARAM(lp);
@@ -561,7 +695,7 @@ static LRESULT CALLBACK map_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         HGDIOBJ oldbmp = SelectObject(mem, dib);
         Gdiplus::Graphics g(mem);
         g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-        g.Clear(Gdiplus::Color(255, 231, 226, 214));
+        g.Clear(Gdiplus::Color(255, 226, 232, 240));
         if (!g_map_state.moved) {
             double lat = 0, lon = 0;
             int n = 0;
@@ -599,9 +733,22 @@ static LRESULT CALLBACK map_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 int dx = static_cast<int>(tx * 256 - left);
                 int dy = static_cast<int>(ty * 256 - top);
                 if (bmp) g.DrawImage(bmp, dx, dy, 256, 256);
-                else want_tile(key);
+                else want_tile(key, true);
             }
         }
+        for (int tx = x0 - 2; tx <= x1 + 2; tx++) {
+            for (int ty = y0 - 2; ty <= y1 + 2; ty++) {
+                if (tx >= x0 && tx <= x1 && ty >= y0 && ty <= y1) continue;
+                queue_tile_xy(g_map_state.zoom, tx, ty, false);
+            }
+        }
+        auto queue_ll = [&](double lat, double lon) {
+            double px = 0, py = 0;
+            project_xy(lat, lon, g_map_state.zoom, px, py);
+            queue_tile_xy(g_map_state.zoom, static_cast<int>(std::floor(px / 256.0)), static_cast<int>(std::floor(py / 256.0)), false);
+        };
+        for (const Member& m : g_row_people) if (m.hasLoc) queue_ll(m.lat, m.lon);
+        for (const Place& p : g_row_places) queue_ll(p.lat, p.lon);
         std::vector<Member> people = g_row_people;
         std::vector<Place> places = g_row_places;
         for (const Place& p : places) {
@@ -723,6 +870,9 @@ static LRESULT CALLBACK map_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     default:
         return DefWindowProcW(hwnd, msg, wp, lp);
     }
+    } catch (...) {
+        return 0;
+    }
 }
 
 static void create_map(HWND parent) {
@@ -732,7 +882,7 @@ static void create_map(HWND parent) {
     wc.lpszClassName = L"FamilyMapView";
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     RegisterClassW(&wc);
-    g_map = CreateWindowExW(WS_EX_CLIENTEDGE, L"FamilyMapView", L"", WS_CHILD | WS_VISIBLE, 0, 0, 10, 10, parent, nullptr, wc.hInstance, nullptr);
+    g_map = CreateWindowExW(0, L"FamilyMapView", L"", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS, 0, 0, 10, 10, parent, nullptr, wc.hInstance, nullptr);
     std::thread(tile_worker).detach();
 }
 
@@ -783,8 +933,15 @@ static std::wstring stay_line(const Member& m) {
         base = L"Arrived to " + where + L" - " + ago_phrase(mins);
     }
     if (m.locationOff) return base + L" · Location is off";
-    bool missed = m.every > 0 && m.ts > 0 && now > m.ts + static_cast<long long>(m.every * 1.5) + 20;
-    if (missed) return base + L" · No recent check-in";
+    bool aliveOn = g_aliveOn.load();
+    int aliveSecs = g_aliveSecs.load();
+    bool unreachable = aliveOn && m.seen > 0 && now > m.seen + static_cast<long long>(aliveSecs) + 25;
+    if (unreachable) return base + L" · Can't reach phone";
+    if (!aliveOn) {
+        long long heard = m.seen > 0 ? m.seen : m.ts;
+        bool missed = m.every > 0 && heard > 0 && now > heard + static_cast<long long>(m.every * 1.5) + 20;
+        if (missed) return base + L" · No recent check-in";
+    }
     return base;
 }
 
@@ -955,6 +1112,54 @@ static void edit_place_ui(const std::string& group, const std::string& id) {
     commit_locked();
 }
 
+static std::string fresh_place_id(const std::string& group) {
+    std::string id = "p" + std::to_string(server_now());
+    if (!g_places.count(key_of(group, id))) return id;
+    for (int n = 1; n < 1000; n++) {
+        std::string next = id + "_" + std::to_string(n);
+        if (!g_places.count(key_of(group, next))) return next;
+    }
+    return id + "_x";
+}
+
+static void create_place_ui(const std::string& group, bool askGroup) {
+    std::wstring name;
+    std::wstring groupName = widen(group);
+    std::string useGroup = group;
+    if (askGroup) {
+        if (groupName.empty()) groupName = L"Family";
+        if (!ask_fields(g_hwnd, L"New place", L"Group name", groupName, L"Place name", &name)) return;
+        useGroup = clip(narrow_w(groupName), 64);
+    } else {
+        if (!ask_fields(g_hwnd, L"New place", L"Place name. It is created at the map center, 100 m across.", name, nullptr, nullptr)) return;
+    }
+    std::string nm = clip(narrow_w(name), 80);
+    while (!nm.empty() && (nm.back() == ' ' || nm.back() == '\t')) nm.pop_back();
+    size_t sp = 0;
+    while (sp < nm.size() && (nm[sp] == ' ' || nm[sp] == '\t')) sp++;
+    if (sp > 0) nm.erase(0, sp);
+    while (!useGroup.empty() && (useGroup.back() == ' ' || useGroup.back() == '\t')) useGroup.pop_back();
+    if (nm.empty() || useGroup.empty()) {
+        MessageBoxW(g_hwnd, L"Enter a place name.", L"Family", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    Place p;
+    p.name = nm;
+    p.groupId = useGroup;
+    p.lat = g_map_state.lat;
+    p.lon = g_map_state.lon;
+    p.radius = 100;
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        p.id = fresh_place_id(p.groupId);
+        g_places[key_of(p.groupId, p.id)] = p;
+        commit_locked();
+    }
+    g_sel_group = p.groupId;
+    g_sel_id = p.id;
+    center_on(p.lat, p.lon);
+}
+
 static void rename_group_ui(const std::string& group) {
     std::wstring name = widen(group);
     if (!ask_fields(g_hwnd, L"Rename group", L"Group name", name, nullptr, nullptr)) return;
@@ -998,15 +1203,32 @@ static RECT hit_rect(int x, int y, int w, int h) {
 }
 
 static void paint_button(Gdiplus::Graphics& g, const RECT& r, const wchar_t* text, Gdiplus::Font& font) {
-    Gdiplus::SolidBrush bg(Gdiplus::Color(255, 244, 241, 234));
-    Gdiplus::Pen pen(Gdiplus::Color(255, 210, 204, 194));
-    g.FillRectangle(&bg, static_cast<INT>(r.left), static_cast<INT>(r.top), static_cast<INT>(r.right - r.left), static_cast<INT>(r.bottom - r.top));
-    g.DrawRectangle(&pen, static_cast<INT>(r.left), static_cast<INT>(r.top), static_cast<INT>(r.right - r.left - 1), static_cast<INT>(r.bottom - r.top - 1));
-    Gdiplus::SolidBrush ink(Gdiplus::Color(255, 26, 25, 22));
-    g.DrawString(text, -1, &font, Gdiplus::PointF(static_cast<float>(r.left + 8), static_cast<float>(r.top + 4)), &ink);
+    Gdiplus::SolidBrush bg(Gdiplus::Color(255, 255, 255, 255));
+    float x = static_cast<float>(r.left);
+    float y = static_cast<float>(r.top);
+    float w = static_cast<float>(r.right - r.left);
+    float h = static_cast<float>(r.bottom - r.top);
+    fill_round_rect(g, bg, x, y, w, h, 8);
+    Gdiplus::Pen pen(Gdiplus::Color(255, 203, 213, 225), 1);
+    g.DrawRectangle(&pen, x, y, w - 1, h - 1);
+    Gdiplus::SolidBrush ink(Gdiplus::Color(255, 30, 41, 59));
+    g.DrawString(text, -1, &font, Gdiplus::PointF(x + 8, y + 4), &ink);
+}
+
+static void draw_pill(Gdiplus::Graphics& g, float x, float y, float w, float h, Gdiplus::Color bg, const wchar_t* text, Gdiplus::Font& font) {
+    Gdiplus::SolidBrush brush(bg);
+    fill_round_rect(g, brush, x, y, w, h, h / 2.0f);
+    Gdiplus::SolidBrush ink(Gdiplus::Color(255, 255, 255, 255));
+    Gdiplus::StringFormat fmt;
+    fmt.SetAlignment(Gdiplus::StringAlignmentCenter);
+    fmt.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+    fmt.SetTrimming(Gdiplus::StringTrimmingEllipsisCharacter);
+    fmt.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
+    g.DrawString(text, -1, &font, Gdiplus::RectF(x, y, w, h), &fmt, &ink);
 }
 
 static LRESULT CALLBACK roster_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    try {
     switch (msg) {
     case WM_ERASEBKGND:
         return 1;
@@ -1043,7 +1265,29 @@ static LRESULT CALLBACK roster_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 }
                 if (h.action == 5) edit_place_ui(h.group, h.id);
                 if (h.action == 6 && MessageBoxW(g_hwnd, L"Delete this place?", L"Family", MB_YESNO | MB_ICONWARNING) == IDYES) remove_place_id(h.group, h.id);
+                if (h.action == 8) {
+                    for (const Member& m : g_row_people) {
+                        if (m.groupId == h.group && m.userId == h.id) {
+                            if (!m.hasLoc) MessageBoxW(g_hwnd, L"No location for this person yet.", L"Family", MB_OK | MB_ICONINFORMATION);
+                            else center_on(m.lat, m.lon);
+                            break;
+                        }
+                    }
+                }
+                if (h.action == 9) {
+                    for (const Place& p : g_row_places) {
+                        if (p.groupId == h.group && p.id == h.id) {
+                            g_sel_group = p.groupId;
+                            g_sel_id = p.id;
+                            center_on(p.lat, p.lon);
+                            break;
+                        }
+                    }
+                }
+                if (h.action == 10) create_place_ui(h.group, false);
+                if (h.action == 11) create_place_ui("", true);
                 InvalidateRect(hwnd, nullptr, FALSE);
+                if (g_map) InvalidateRect(g_map, nullptr, FALSE);
                 break;
             }
         }
@@ -1059,62 +1303,91 @@ static LRESULT CALLBACK roster_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         HGDIOBJ old = SelectObject(mem, dib);
         Gdiplus::Graphics g(mem);
         g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-        g.Clear(Gdiplus::Color(255, 247, 244, 238));
+        g.SetTextRenderingHint(Gdiplus::TextRenderingHintClearTypeGridFit);
+        g.Clear(Gdiplus::Color(255, 241, 245, 249));
         g.TranslateTransform(0, static_cast<float>(-g_roster_scroll));
-        Gdiplus::Font title(L"Segoe UI", 15, Gdiplus::FontStyleBold);
-        Gdiplus::Font body(L"Segoe UI", 12);
-        Gdiplus::Font small(L"Segoe UI", 10);
-        Gdiplus::SolidBrush ink(Gdiplus::Color(255, 26, 25, 22));
-        Gdiplus::SolidBrush muted(Gdiplus::Color(255, 92, 88, 79));
+        Gdiplus::Font title(L"Segoe UI", 13, Gdiplus::FontStyleBold);
+        Gdiplus::Font body(L"Segoe UI", 12, Gdiplus::FontStyleBold);
+        Gdiplus::Font small(L"Segoe UI", 9);
+        Gdiplus::Font section(L"Segoe UI", 10, Gdiplus::FontStyleBold);
+        Gdiplus::SolidBrush ink(Gdiplus::Color(255, 15, 23, 42));
+        Gdiplus::SolidBrush muted(Gdiplus::Color(255, 100, 116, 139));
+        Gdiplus::SolidBrush cardShadow(Gdiplus::Color(16, 15, 23, 42));
+        Gdiplus::StringFormat clipText;
+        clipText.SetTrimming(Gdiplus::StringTrimmingEllipsisCharacter);
+        clipText.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
         g_hits.clear();
-        int y = 8;
-        int width = rc.right - 16;
+        int y = 4;
+        int width = rc.right - 8;
+        if (width < 40) width = 40;
         std::vector<std::string> groups;
         for (const Member& m : g_row_people) if (std::find(groups.begin(), groups.end(), m.groupId) == groups.end()) groups.push_back(m.groupId);
         for (const Place& p : g_row_places) if (std::find(groups.begin(), groups.end(), p.groupId) == groups.end()) groups.push_back(p.groupId);
+        long long nowS = server_now();
+        bool aliveOn = g_aliveOn.load();
+        int aliveSecs = g_aliveSecs.load();
         if (groups.empty()) {
-            g.DrawString(L"No one has checked in yet.", -1, &body, Gdiplus::PointF(12, 12), &muted);
-            y = 40;
+            g.DrawString(L"No one has checked in yet.", -1, &body, Gdiplus::PointF(8, 8), &muted);
+            RECT add = hit_rect(8, 40, 108, 28);
+            paint_button(g, add, L"Add place", small);
+            g_hits.push_back({add, 11, "", ""});
+            y = 80;
         }
         for (const std::string& group : groups) {
-            Gdiplus::StringFormat clipText;
-            clipText.SetTrimming(Gdiplus::StringTrimmingEllipsisCharacter);
-            clipText.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
-            Gdiplus::RectF titleRect(12, static_cast<float>(y), static_cast<float>(width - 170), 26);
+            Gdiplus::RectF titleRect(8, static_cast<float>(y), static_cast<float>(width - 168), 24);
             g.DrawString(widen(group).c_str(), -1, &title, titleRect, &clipText, &ink);
-            RECT rename = hit_rect(width - 158, y, 74, 26);
-            RECT delg = hit_rect(width - 78, y, 70, 26);
+            RECT rename = hit_rect(width - 150, y, 70, 26);
+            RECT delg = hit_rect(width - 74, y, 66, 26);
             paint_button(g, rename, L"Rename", small);
             paint_button(g, delg, L"Delete", small);
             g_hits.push_back({rename, 1, group, ""});
             g_hits.push_back({delg, 2, group, ""});
-            y += 40;
-            g.DrawString(L"People", -1, &small, Gdiplus::PointF(12, static_cast<float>(y)), &muted);
-            y += 20;
+            y += 34;
+            g.DrawString(L"FAMILY", -1, &section, Gdiplus::PointF(8, static_cast<float>(y)), &muted);
+            y += 22;
             bool any_person = false;
             for (const Member& m : g_row_people) {
                 if (m.groupId != group) continue;
                 any_person = true;
-                int cardH = 124;
-                Gdiplus::SolidBrush card(Gdiplus::Color(255, 255, 252, 247));
-                g.FillRectangle(&card, 8, y, width, cardH);
+                int cardH = 132;
+                fill_round_rect(g, cardShadow, 6, static_cast<float>(y + 2), static_cast<float>(width - 4), static_cast<float>(cardH), 14);
+                Gdiplus::SolidBrush card(Gdiplus::Color(255, 255, 255, 255));
+                fill_round_rect(g, card, 4, static_cast<float>(y), static_cast<float>(width - 4), static_cast<float>(cardH), 14);
+                RECT faceHit = hit_rect(16, y + 12, 44, 44);
+                g_hits.push_back({faceHit, 8, group, m.userId});
                 Gdiplus::Bitmap* face = face_bitmap(m);
                 if (face) {
                     Gdiplus::GraphicsPath clip;
-                    clip.AddEllipse(16, y + 12, 40, 40);
+                    clip.AddEllipse(16, y + 12, 44, 44);
                     g.SetClip(&clip);
-                    g.DrawImage(face, 16, y + 12, 40, 40);
+                    g.DrawImage(face, 16, y + 12, 44, 44);
                     g.ResetClip();
                 } else {
-                    Gdiplus::SolidBrush dot(Gdiplus::Color(255, 200, 16, 46));
-                    g.FillEllipse(&dot, 16, y + 12, 40, 40);
+                    Gdiplus::SolidBrush dot(Gdiplus::Color(255, 37, 99, 235));
+                    g.FillEllipse(&dot, 16, y + 12, 44, 44);
+                    std::wstring letter = widen(m.name.empty() ? m.userId : m.name);
+                    if (!letter.empty()) letter = letter.substr(0, 1);
+                    Gdiplus::SolidBrush white(Gdiplus::Color(255, 255, 255, 255));
+                    g.DrawString(letter.c_str(), -1, &body, Gdiplus::PointF(30, static_cast<float>(y + 22)), &white);
                 }
-                Gdiplus::RectF nameRect(64, static_cast<float>(y + 8), static_cast<float>(width - 80), 20);
+                Gdiplus::Pen ring(Gdiplus::Color(255, 226, 232, 240), 1);
+                g.DrawEllipse(&ring, 16, y + 12, 44, 44);
+                bool unreachable = aliveOn && m.seen > 0 && nowS > m.seen + static_cast<long long>(aliveSecs) + 25;
+                const wchar_t* pill = L"Online";
+                Gdiplus::Color pillBg(255, 22, 163, 74);
+                if (unreachable) {
+                    pill = L"Offline";
+                    pillBg = Gdiplus::Color(255, 220, 38, 38);
+                } else if (m.seen <= 0 && !m.hasLoc) {
+                    pill = L"Waiting";
+                    pillBg = Gdiplus::Color(255, 100, 116, 139);
+                }
+                draw_pill(g, static_cast<float>(width - 86), static_cast<float>(y + 12), 72, 22, pillBg, pill, small);
+                Gdiplus::RectF nameRect(68, static_cast<float>(y + 12), static_cast<float>(width - 164), 22);
                 std::wstring who = widen(m.name.empty() ? m.userId : m.name);
                 g.DrawString(who.c_str(), -1, &body, nameRect, &clipText, &ink);
-                Gdiplus::RectF stayRect(64, static_cast<float>(y + 28), static_cast<float>(width - 80), 18);
-                std::wstring sub = stay_line(m);
-                g.DrawString(sub.c_str(), -1, &small, stayRect, &clipText, &muted);
+                Gdiplus::RectF stayRect(68, static_cast<float>(y + 36), static_cast<float>(width - 84), 18);
+                g.DrawString(stay_line(m).c_str(), -1, &small, stayRect, &clipText, &muted);
                 std::wstring phone = m.phone.empty() ? L"" : widen(m.phone);
                 if (m.battery >= 0) {
                     if (!phone.empty()) phone += L"   ";
@@ -1127,54 +1400,81 @@ static LRESULT CALLBACK roster_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     if (!phone.empty()) phone += L"   ";
                     phone += L"No signal";
                 }
+                if (m.wifi) {
+                    if (!phone.empty()) phone += L"   ";
+                    phone += L"Wi-Fi";
+                    if (!m.ssid.empty()) phone += L" " + widen(m.ssid);
+                }
                 if (!phone.empty()) {
-                    Gdiplus::RectF phoneRect(16, static_cast<float>(y + 52), static_cast<float>(width - 32), 18);
+                    Gdiplus::RectF phoneRect(16, static_cast<float>(y + 62), static_cast<float>(width - 28), 18);
                     g.DrawString(phone.c_str(), -1, &small, phoneRect, &clipText, &muted);
                 }
-                RECT hist = hit_rect(width - 236, y + cardH - 34, 72, 26);
-                RECT edit = hit_rect(width - 156, y + cardH - 34, 68, 26);
-                RECT del = hit_rect(width - 80, y + cardH - 34, 68, 26);
+                RECT hist = hit_rect(width - 224, y + cardH - 36, 68, 26);
+                RECT edit = hit_rect(width - 150, y + cardH - 36, 60, 26);
+                RECT del = hit_rect(width - 84, y + cardH - 36, 66, 26);
                 paint_button(g, hist, L"History", small);
                 paint_button(g, edit, L"Edit", small);
                 paint_button(g, del, L"Delete", small);
                 g_hits.push_back({hist, 7, group, m.userId});
                 g_hits.push_back({edit, 3, group, m.userId});
                 g_hits.push_back({del, 4, group, m.userId});
-                y += cardH + 8;
+                y += cardH + 10;
             }
             if (!any_person) {
-                g.DrawString(L"No people in this group.", -1, &small, Gdiplus::PointF(16, static_cast<float>(y)), &muted);
+                g.DrawString(L"No people in this group.", -1, &small, Gdiplus::PointF(12, static_cast<float>(y)), &muted);
                 y += 22;
             }
-            g.DrawString(L"Places", -1, &small, Gdiplus::PointF(12, static_cast<float>(y)), &muted);
-            y += 18;
-            g.DrawString(L"Each place has its own arrive and leave distance.", -1, &small, Gdiplus::PointF(12, static_cast<float>(y)), &muted);
-            y += 20;
+            g.DrawString(L"SAVED PLACES", -1, &section, Gdiplus::PointF(8, static_cast<float>(y + 4)), &muted);
+            RECT addPlace = hit_rect(width - 108, y, 96, 26);
+            paint_button(g, addPlace, L"Add place", small);
+            g_hits.push_back({addPlace, 10, group, ""});
+            y += 32;
             bool any_place = false;
             for (const Place& p : g_row_places) {
                 if (p.groupId != group) continue;
                 any_place = true;
-                int cardH = 84;
-                Gdiplus::SolidBrush card(Gdiplus::Color(255, 255, 252, 247));
-                g.FillRectangle(&card, 8, y, width, cardH);
-                Gdiplus::RectF nameRect(16, static_cast<float>(y + 8), static_cast<float>(width - 32), 20);
-                g.DrawString(widen(p.name).c_str(), -1, &body, nameRect, &clipText, &ink);
-                std::wstring meta = L"Arrived inside " + std::to_wstring(static_cast<int>(p.radius)) + L" m. Left once they move past it.";
-                Gdiplus::RectF metaRect(16, static_cast<float>(y + 30), static_cast<float>(width - 32), 18);
+                int cardH = 108;
+                fill_round_rect(g, cardShadow, 6, static_cast<float>(y + 2), static_cast<float>(width - 4), static_cast<float>(cardH), 14);
+                Gdiplus::SolidBrush card(Gdiplus::Color(255, 255, 255, 255));
+                fill_round_rect(g, card, 4, static_cast<float>(y), static_cast<float>(width - 4), static_cast<float>(cardH), 14);
+                RECT iconHit = hit_rect(16, y + 12, 44, 44);
+                g_hits.push_back({iconHit, 9, group, p.id});
+                Gdiplus::Bitmap* pic = place_bitmap(p);
+                if (pic) {
+                    Gdiplus::GraphicsPath clip;
+                    float ix = 16.0f;
+                    float iy = static_cast<float>(y + 12);
+                    float side = 44.0f;
+                    float rr = 10.0f;
+                    clip.AddArc(ix, iy, rr, rr, 180.0f, 90.0f);
+                    clip.AddArc(ix + side - rr, iy, rr, rr, 270.0f, 90.0f);
+                    clip.AddArc(ix + side - rr, iy + side - rr, rr, rr, 0.0f, 90.0f);
+                    clip.AddArc(ix, iy + side - rr, rr, rr, 90.0f, 90.0f);
+                    clip.CloseFigure();
+                    g.SetClip(&clip);
+                    g.DrawImage(pic, 16, y + 12, 44, 44);
+                    g.ResetClip();
+                } else {
+                    draw_house_icon(g, 16, static_cast<float>(y + 12), 44);
+                }
+                Gdiplus::RectF nameRect(70, static_cast<float>(y + 14), static_cast<float>(width - 90), 22);
+                g.DrawString(widen(p.name.empty() ? "Place" : p.name).c_str(), -1, &body, nameRect, &clipText, &ink);
+                std::wstring meta = std::to_wstring(static_cast<int>(p.radius)) + L" m radius";
+                Gdiplus::RectF metaRect(70, static_cast<float>(y + 38), static_cast<float>(width - 90), 18);
                 g.DrawString(meta.c_str(), -1, &small, metaRect, &clipText, &muted);
-                RECT edit = hit_rect(width - 156, y + cardH - 32, 68, 26);
-                RECT del = hit_rect(width - 80, y + cardH - 32, 68, 26);
+                RECT edit = hit_rect(width - 150, y + cardH - 36, 60, 26);
+                RECT del = hit_rect(width - 84, y + cardH - 36, 66, 26);
                 paint_button(g, edit, L"Edit", small);
                 paint_button(g, del, L"Delete", small);
                 g_hits.push_back({edit, 5, group, p.id});
                 g_hits.push_back({del, 6, group, p.id});
-                y += cardH + 8;
+                y += cardH + 10;
             }
             if (!any_place) {
-                g.DrawString(L"No shared places.", -1, &small, Gdiplus::PointF(16, static_cast<float>(y)), &muted);
+                g.DrawString(L"No shared places yet. Add one at the map center.", -1, &small, Gdiplus::PointF(12, static_cast<float>(y)), &muted);
                 y += 22;
             }
-            y += 12;
+            y += 8;
         }
         g_roster_content = y + 8;
         BitBlt(hdc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
@@ -1187,8 +1487,10 @@ static LRESULT CALLBACK roster_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     default:
         return DefWindowProcW(hwnd, msg, wp, lp);
     }
+    } catch (...) {
+        return 0;
+    }
 }
-
 static void create_roster(HWND parent) {
     WNDCLASSW wc{};
     wc.lpfnWndProc = roster_proc;
@@ -1428,3 +1730,76 @@ static void open_history(HWND owner, const std::string& group, const std::string
 }
 
 
+
+static void paint_shell(HWND hwnd) {
+    PAINTSTRUCT ps{};
+    HDC hdc = BeginPaint(hwnd, &ps);
+    struct End {
+        HWND hwnd;
+        PAINTSTRUCT* ps;
+        ~End() { EndPaint(hwnd, ps); }
+    } end{hwnd, &ps};
+    RECT rc{};
+    GetClientRect(hwnd, &rc);
+    int w = rc.right > 0 ? rc.right : 1;
+    int h = rc.bottom > 0 ? rc.bottom : 1;
+    HDC mem = CreateCompatibleDC(hdc);
+    HBITMAP dib = CreateCompatibleBitmap(hdc, w, h);
+    HGDIOBJ old = SelectObject(mem, dib);
+    Gdiplus::Graphics g(mem);
+    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    g.SetTextRenderingHint(Gdiplus::TextRenderingHintClearTypeGridFit);
+    Gdiplus::SolidBrush page(Gdiplus::Color(255, 241, 245, 249));
+    g.FillRectangle(&page, 0, 0, w, h);
+    const int headerH = 86;
+    Gdiplus::SolidBrush blue(Gdiplus::Color(255, 29, 78, 216));
+    g.FillRectangle(&blue, 0, 0, w, headerH);
+    float pinX = 18;
+    float pinY = 14;
+    float pin = 22;
+    Gdiplus::SolidBrush white(Gdiplus::Color(255, 255, 255, 255));
+    g.FillEllipse(&white, pinX, pinY, pin, pin);
+    Gdiplus::PointF tri[3] = {
+        Gdiplus::PointF(pinX + pin * 0.18f, pinY + pin * 0.62f),
+        Gdiplus::PointF(pinX + pin * 0.82f, pinY + pin * 0.62f),
+        Gdiplus::PointF(pinX + pin * 0.50f, pinY + pin * 1.22f),
+    };
+    g.FillPolygon(&white, tri, 3);
+    Gdiplus::SolidBrush hole(Gdiplus::Color(255, 29, 78, 216));
+    g.FillEllipse(&hole, pinX + pin * 0.30f, pinY + pin * 0.24f, pin * 0.40f, pin * 0.40f);
+    Gdiplus::Font title(L"Segoe UI", 18, Gdiplus::FontStyleBold);
+    Gdiplus::Font sub(L"Segoe UI", 11);
+    Gdiplus::SolidBrush titleInk(Gdiplus::Color(255, 255, 255, 255));
+    Gdiplus::SolidBrush subInk(Gdiplus::Color(230, 255, 255, 255));
+    g.DrawString(L"Family Location Server", -1, &title, Gdiplus::PointF(52, 10), &titleInk);
+    Gdiplus::StringFormat clip;
+    clip.SetTrimming(Gdiplus::StringTrimmingEllipsisCharacter);
+    clip.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
+    float textW = static_cast<float>(w - 250);
+    if (textW < 40) textW = 40;
+    g.DrawString(widen(g_home_line).c_str(), -1, &sub, Gdiplus::RectF(52, 42, textW, 18), &clip, &subInk);
+    g.DrawString(widen(g_tail_line).c_str(), -1, &sub, Gdiplus::RectF(52, 60, textW, 18), &clip, &subInk);
+    bool online = g_status.find("Listening") != std::string::npos;
+    draw_pill(g, static_cast<float>(w - 176), 26, 154, 32,
+        online ? Gdiplus::Color(255, 22, 163, 74) : Gdiplus::Color(255, 220, 38, 38),
+        online ? L"Server Online" : L"Offline", sub);
+    int footerTop = h - 56;
+    if (footerTop < headerH) footerTop = headerH;
+    Gdiplus::SolidBrush footBg(Gdiplus::Color(255, 248, 250, 252));
+    g.FillRectangle(&footBg, 0, footerTop, w, h - footerTop);
+    Gdiplus::Pen hair(Gdiplus::Color(255, 226, 232, 240), 1);
+    g.DrawLine(&hair, 0, footerTop, w, footerTop);
+    Gdiplus::Font foot(L"Segoe UI", 11);
+    Gdiplus::SolidBrush footInk(Gdiplus::Color(255, 71, 85, 105));
+    std::wstring status = online ? L"Listening on port 8000" : widen(g_status);
+    if (!g_live) status += L"  ·  updates paused";
+    status += L"   ·   " + std::to_wstring(g_n_people) + L" people   ·   " + std::to_wstring(g_n_places) + L" places";
+    g.DrawString(status.c_str(), -1, &foot, Gdiplus::RectF(18, static_cast<float>(footerTop + 6), static_cast<float>(w - 36), 20), &clip, &footInk);
+    Gdiplus::Font hint(L"Segoe UI", 9);
+    g.DrawString(L"Drag a place to move it. Scroll the wheel on a selected place to change its radius. History, edit, and delete stay on each card.",
+        -1, &hint, Gdiplus::RectF(18, static_cast<float>(footerTop + 28), static_cast<float>(w - 36), 18), &clip, &footInk);
+    BitBlt(hdc, 0, 0, w, h, mem, 0, 0, SRCCOPY);
+    SelectObject(mem, old);
+    DeleteObject(dib);
+    DeleteDC(mem);
+}

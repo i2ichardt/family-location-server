@@ -1,73 +1,42 @@
 # Family location server
 
-Windows program for the family map. Phones send a pin, a name, a phone number, and a photo. This program keeps the latest pin for each person, plus the places the group shares. It listens on port **8000** on every address of this PC, so the same window answers on home Wi-Fi and on Tailscale.
+The phone opens on a map. Pins, names, and photos stay on this PC. At home the app uses the PC’s LAN address. Away from that Wi-Fi it uses the Tailscale address. Both are saved in the phone’s Settings.
 
-The phone app is [location-test](https://github.com/i2ichardt/location-test).
+The Android app is [location-test](https://github.com/i2ichardt/location-test).
 
 ## Download
 
-The compiled program is on the [v1.8 release](https://github.com/i2ichardt/family-location-server/releases/tag/v1.8).
+The compiled server is [server 1.9](https://github.com/i2ichardt/family-location-server/releases/tag/v1.9).
 
-- [FamilyLocationServer.exe](https://github.com/i2ichardt/family-location-server/releases/download/v1.8/FamilyLocationServer.exe)
-- [FamilyLocationServer-windows.zip](https://github.com/i2ichardt/family-location-server/releases/download/v1.8/FamilyLocationServer-windows.zip) — program, how-to, and firewall script
+[Download FamilyLocationServer-windows.zip](https://github.com/i2ichardt/family-location-server/releases/download/v1.9/FamilyLocationServer-windows.zip)
 
-## On the PC
+## Set it up
 
-The window lists **Home** as `http://<LAN address>:8000` and **Tailscale** as `http://<100.x address>:8000`. The saved Tailscale address, the one phones use when they are away, is under **File → Settings**.
+1. **Join one tailnet.** Install Tailscale on the Windows 11 PC and on each phone. Sign in with the same account and pick the Personal plan. It is free for non-commercial use, up to 6 users, with as many devices as you need.
 
-The map shows the people who have sent a pin. People standing together share one pin, side by side. Each saved place is drawn with a circle the size of its arrive and leave distance, labeled with the meters. Drag a place's dot to move it. Click a place, then scroll the mouse wheel, to change that distance. Click empty map to clear the selection so the wheel zooms again. **View → Satellite** switches to aerial photos. **View → Pause updates** freezes the map and the list. Profile photos are the pins and update when a phone saves a new one. A place can also keep its own photo. Each person has a **History** button for that person's check-ins. **File → Check-in database** is the full trail as coordinates. Battery, signal, and a missed check-in show on each person when the phone sends them. If a phone turns location off, the row says so. Edit a place to change how many meters count as arrived or left.
+2. **Start the server.** Unzip the Windows download and run FamilyLocationServer.exe. It listens on port 8000 for both the home network and Tailscale. The saved Tailscale address is under File, then Settings. Minimize hides the window and leaves a tray icon. Click the icon to open it again. Closing the window stops it. If Windows blocks the unsigned file, choose More info, then Run anyway, and allow it on Private networks.
 
-## Run it
+3. **Install the app** on each phone from the location-test releases. Allow location when it asks.
 
-1. Save `FamilyLocationServer.exe` in a folder. `allow-firewall.ps1` can sit next to it.
-2. Double-click the program.
-3. The window shows people and shared places. The status line should say it is listening on port 8000.
-4. If Windows says it protected your PC, choose **More info**, then **Run anyway**. Allow the firewall prompt on **Private** networks.
-5. Minimize the window to keep the server running. It stays on the taskbar. Closing the window stops the program and ends the process. There is no system-tray icon.
+4. **Save both addresses** in the phone’s Settings. Home Wi-Fi is this PC’s LAN address from `ipconfig`, like `http://192.168.1.5:8000`. Tailscale is `tailscale ip -4`, like `http://100.x.x.x:8000`. Leave the choice on Auto. Use the same group name on every phone.
 
-Profiles, photos, pins, and places are saved in a `data` folder next to the program. **File → Open saved data** opens that folder. Closing the window does not erase them.
+## Which address to type
 
-## Addresses the phone should save
+| Phone | Server URL |
+| --- | --- |
+| On the same Wi-Fi | `http://PC-LAN-address:8000` |
+| Mobile data, or any network | `http://100.x.x.x:8000` |
 
-Find both on this PC and type them into the phone's Settings. Leave the phone on **Auto**. Auto tries the home address first. If the phone is not on that Wi-Fi, the home address does not answer and the app uses Tailscale.
+Tailscale encrypts the tunnel. This server does not. It has no password and no HTTPS. Anyone on the tailnet who knows the address can read the pins. Do not forward port 8000 to the public internet.
 
-| Where the phone is | Address |
-|---|---|
-| Same Wi-Fi | `http://192.168.x.x:8000` from `ipconfig` |
-| Anywhere else | `http://100.x.x.x:8000` from `tailscale ip -4` |
+## The window
 
-Use `http://`, not `https://`. A MagicDNS name works too: `http://PCNAME.tailnet.ts.net:8000`.
+The map is on the left. Family and saved places are on the right. The footer shows port 8000 and the people and places counts.
 
-Every phone in the family uses the same group name.
+Click a person or place icon to center the map. Add place creates a shared place at the map center. Drag a place to move it. Select a place and use the mouse wheel to change its radius. Each person has History, Edit, and Delete.
 
-## If a phone cannot connect
+File, then Settings sets the Tailscale address, how many records to keep per person (default 50), and the alive check. The server asks each phone if it is still there. If no answer comes back in time, that person is not contactable until they respond.
 
-- The window is open, or the program is minimized on the taskbar. Closing it stops the server.
-- The URL starts with `http://` and ends with `:8000`.
-- Both Tailscale apps say Connected when you are testing the Tailscale address.
-- Right-click `allow-firewall.ps1`, choose **Run with PowerShell**, and approve the administrator prompt. That opens TCP port 8000 on private networks only.
+A fix that is too fast to be real, a coarse network fix right after GPS, or a point that says someone left while their phone is still on that place’s Wi-Fi is dropped. Someone who is still keeps the saved anchor, so a person in bed does not flip between left home and arrived home.
 
-## What the phones send
-
-| Call | What it stores |
-|---|---|
-| `POST /profile` | Name, phone number, and the profile photo |
-| `POST /send` | Latest latitude and longitude for that person |
-| `GET /group?groupId=Fam1` | Everyone in the group, plus shared places |
-| `POST /place` | A place the whole group can see |
-| `GET /health` | `OK` if the program is running |
-
-`GET /fetch` still returns one person's latest pin.
-
-## Keep it private
-
-There is no password and no HTTPS. Tailscale encrypts the path between the phone and this PC. Anyone on your tailnet who can open port 8000 can read the pins. Do not forward port 8000 on your router.
-
-## Rebuild
-
-`server.cpp` is C++17. Headers in `include/` are cpp-httplib and nlohmann/json, both MIT.
-
-```
-cmake -S . -B build
-cmake --build build --config Release
-```
+The server keeps profiles, photos, pins, and places in a data folder next to the program. See HOWTO.txt in the zip.

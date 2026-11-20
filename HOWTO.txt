@@ -8,9 +8,9 @@ Family location server
    Choose More info, then Run anyway.
    If a firewall prompt appears, allow it on Private networks.
 
-2. Minimizing the window keeps the server running. It stays on the taskbar.
-   Closing the window stops the program and ends the process.
-   There is no system-tray icon.
+2. Minimizing the window hides it and leaves a system-tray icon.
+   Click that icon to bring the window back.
+   Closing the window still stops the program. There is no password.
 
 3. If nothing can connect, right-click allow-firewall.ps1 and run it
    with PowerShell as Administrator.
@@ -35,7 +35,9 @@ Each saved place has its own arrive and leave distance, in meters. Drag a place'
 
 Click empty map to clear the selection so the wheel zooms again.
 
-Profile photos update when a phone saves a new one. Battery percentage is shown on each person when the phone sends it.
+File, then Settings holds the Tailscale address, how many location records to keep for each person (default 50; older ones are deleted), and the "are you alive" check. That check is on by default and asks about every 75 seconds. If a phone does not answer in time, it is marked not contactable until it responds.
+
+Saved places can be created on the server with Add place. That uses the center of the map and a 100 m radius. You can rename it and drag the dot afterward. Click a person or place icon in the list to center the map on them.
 
 File, then Open saved data opens the folder next to the program. File, then Exit stops the program, the same as closing the window.
 
