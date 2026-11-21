@@ -798,7 +798,17 @@ static void setup_routes(httplib::Server& server) {
                 bool coarse = prov != "gps" && (!hasAcc || acc > 50.0);
                 bool recentGps = m.prov == "gps" && m.acceptedAt > 0 && seen - m.acceptedAt < 90;
                 if (coarse && recentGps) reject = true;
-                if (wifi && !ssid.empty() && wifi_outside_place_locked(groupId, ssid, lat, lon)) reject = true;
+                if (wifi && !ssid.empty() && wifi_outside_place_locked(groupId, ssid, lat, lon)) {
+                    if (m.hasLoc && !(m.anchorLat == 0.0 && m.anchorLon == 0.0)) {
+                        m.lat = m.anchorLat;
+                        m.lon = m.anchorLon;
+                    }
+                    m.traveling = false;
+                    m.speed = 0;
+                    commit_locked();
+                    saved();
+                    return;
+                }
                 if (reject) {
                     commit_locked();
                     saved();
@@ -808,79 +818,65 @@ static void setup_routes(httplib::Server& server) {
                 anchor_ref(m, aLat, aLon);
                 bool hasPrev = m.hasLoc;
                 double distAnchor = hasPrev ? haversine_m(aLat, aLon, lat, lon) : 0;
-                double distLast = hasPrev ? haversine_m(m.lat, m.lon, lat, lon) : 0;
-                double limit = m.traveling ? 0.6 : 1.2;
-                bool crawling = hasSpeed && speed < limit;
-                bool nearAnchor = !hasPrev || distAnchor < 35.0;
-                bool nearLast = !hasPrev || distLast < 35.0;
                 bool recordHistory = true;
+                const Place* held = place_by_name_locked(m.groupId, m.area);
+                bool insideHeld = held && haversine_m(lat, lon, held->lat, held->lon) <= leave_radius(*held);
+                const Place* here = place_inside_locked(m.groupId, lat, lon);
+                bool insideSomewhere = insideHeld || here != nullptr;
+                // Under about 4.5 mph is noise from a phone that is sitting still, or a slow walk.
+                bool slow = !hasSpeed || speed < 2.0;
+                long long gap = m.acceptedAt > 0 ? seen - m.acceptedAt : 0;
+                bool spike = hasPrev && gap >= 1 && gap <= 120 && slow && distAnchor / static_cast<double>(gap) > 4.0;
+                if (spike && !insideSomewhere) {
+                    commit_locked();
+                    saved();
+                    return;
+                }
                 auto snap_anchor = [&]() {
                     if (m.anchorLat == 0.0 && m.anchorLon == 0.0) {
                         m.anchorLat = aLat;
                         m.anchorLon = aLon;
                     }
+                    if (m.anchorLat == 0.0 && m.anchorLon == 0.0) {
+                        m.anchorLat = lat;
+                        m.anchorLon = lon;
+                    }
                     m.lat = m.anchorLat;
                     m.lon = m.anchorLon;
                     m.traveling = false;
+                    m.speed = 0;
                 };
-                if (hasSpeed && crawling && nearAnchor) {
-                    if (!hasPrev) {
-                        m.anchorLat = lat;
-                        m.anchorLon = lon;
-                        m.lat = lat;
-                        m.lon = lon;
-                        m.traveling = false;
-                        apply_area_change_locked(m, lat, lon, ts);
-                        if (m.arrived <= 0) m.arrived = ts;
-                    } else {
-                        snap_anchor();
-                        recordHistory = false;
-                    }
-                } else if (!hasSpeed && nearAnchor) {
-                    if (!hasPrev) {
-                        m.anchorLat = lat;
-                        m.anchorLon = lon;
-                        m.lat = lat;
-                        m.lon = lon;
-                        m.traveling = false;
-                        apply_area_change_locked(m, lat, lon, ts);
-                        if (m.arrived <= 0) m.arrived = ts;
-                    } else {
-                        snap_anchor();
-                        recordHistory = false;
-                    }
-                } else if (hasSpeed && m.traveling && speed < 0.6 && nearLast) {
-                    m.traveling = false;
+                // Still at a saved place, or only a short GPS wander: keep the anchor and clear traveling.
+                bool settled = insideSomewhere && (!hasSpeed || speed < 3.5);
+                bool wander = !hasPrev || distAnchor < 80.0;
+                if (!hasPrev) {
                     m.anchorLat = lat;
                     m.anchorLon = lon;
                     m.lat = lat;
                     m.lon = lon;
+                    m.traveling = false;
+                    m.speed = 0;
                     apply_area_change_locked(m, lat, lon, ts);
-                    if (m.area.empty()) m.arrived = ts;
+                    if (m.arrived <= 0) m.arrived = ts;
+                } else if (settled || (slow && wander)) {
+                    if (here && m.area != here->name) apply_area_change_locked(m, lat, lon, ts);
+                    snap_anchor();
+                    recordHistory = false;
                 } else {
-                    if (!hasPrev) {
-                        m.anchorLat = lat;
-                        m.anchorLon = lon;
-                        m.lat = lat;
-                        m.lon = lon;
-                        m.traveling = true;
-                        m.departed = ts;
-                        m.departedFrom = "this spot";
-                        apply_area_change_locked(m, lat, lon, ts);
-                        if (m.arrived <= 0) m.arrived = ts;
-                    } else {
-                        depart_locked(m, ts);
-                        m.lat = lat;
-                        m.lon = lon;
-                        apply_area_change_locked(m, lat, lon, ts);
-                    }
+                    depart_locked(m, ts);
+                    m.lat = lat;
+                    m.lon = lon;
+                    m.anchorLat = lat;
+                    m.anchorLon = lon;
+                    apply_area_change_locked(m, lat, lon, ts);
+                    if (hasSpeed) m.speed = speed;
                 }
                 m.ts = ts;
                 m.hasLoc = true;
                 m.acceptedAt = seen;
                 m.acc = hasAcc ? acc : -1;
                 m.prov = prov;
-                if (hasSpeed) m.speed = speed;
+                if (m.traveling && hasSpeed) m.speed = speed;
                 remember_place_ssid_locked(m);
                 if (recordHistory) {
                     note_checkin_locked(m);
