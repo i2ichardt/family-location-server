@@ -76,6 +76,9 @@ struct Member {
     std::string ssid;
     long long seen = 0;
     long long acceptedAt = 0;
+    bool pendingOut = false;
+    double pendingLat = 0;
+    double pendingLon = 0;
 };
 
 struct Place {
@@ -254,6 +257,9 @@ static void save_locked() {
             {"ssid", m.ssid},
             {"seen", m.seen},
             {"acceptedAt", m.acceptedAt},
+            {"pendingOut", m.pendingOut},
+            {"pendingLat", m.pendingLat},
+            {"pendingLon", m.pendingLon},
         });
     }
     json places = json::array();
@@ -482,6 +488,9 @@ static void load_store() {
             m.ssid = j.value("ssid", "");
             m.seen = j.value("seen", 0LL);
             m.acceptedAt = j.value("acceptedAt", 0LL);
+            m.pendingOut = j.value("pendingOut", false);
+            m.pendingLat = j.value("pendingLat", 0.0);
+            m.pendingLon = j.value("pendingLon", 0.0);
             g_members[key_of(m.groupId, m.userId)] = m;
         }
     }
@@ -540,6 +549,17 @@ static bool json_bool(const json& j, const char* key, bool fallback) {
 
 static double place_radius(const Place& p) {
     return p.radius < 20 ? 20 : p.radius;
+}
+
+static double bearing_deg(double lat1, double lon1, double lat2, double lon2) {
+    double p1 = lat1 * 3.141592653589793 / 180.0;
+    double p2 = lat2 * 3.141592653589793 / 180.0;
+    double dl = (lon2 - lon1) * 3.141592653589793 / 180.0;
+    double y = std::sin(dl) * std::cos(p2);
+    double x = std::cos(p1) * std::sin(p2) - std::sin(p1) * std::cos(p2) * std::cos(dl);
+    double deg = std::atan2(y, x) * 180.0 / 3.141592653589793;
+    if (deg < 0) deg += 360.0;
+    return deg;
 }
 
 static double leave_radius(const Place& p) {
@@ -814,6 +834,11 @@ static void setup_routes(httplib::Server& server) {
                     saved();
                     return;
                 }
+                if (hasAcc && acc > 100.0) {
+                    commit_locked();
+                    saved();
+                    return;
+                }
                 double aLat = 0, aLon = 0;
                 anchor_ref(m, aLat, aLon);
                 bool hasPrev = m.hasLoc;
@@ -845,6 +870,7 @@ static void setup_routes(httplib::Server& server) {
                     m.lon = m.anchorLon;
                     m.traveling = false;
                     m.speed = 0;
+                    m.pendingOut = false;
                 };
                 // Still at a saved place, or only a short GPS wander: keep the anchor and clear traveling.
                 bool settled = insideSomewhere && (!hasSpeed || speed < 3.5);
@@ -858,18 +884,37 @@ static void setup_routes(httplib::Server& server) {
                     m.speed = 0;
                     apply_area_change_locked(m, lat, lon, ts);
                     if (m.arrived <= 0) m.arrived = ts;
+                    m.pendingOut = false;
                 } else if (settled || (slow && wander)) {
                     if (here && m.area != here->name) apply_area_change_locked(m, lat, lon, ts);
                     snap_anchor();
                     recordHistory = false;
                 } else {
-                    depart_locked(m, ts);
-                    m.lat = lat;
-                    m.lon = lon;
-                    m.anchorLat = lat;
-                    m.anchorLon = lon;
-                    apply_area_change_locked(m, lat, lon, ts);
-                    if (hasSpeed) m.speed = speed;
+                    bool confirmed = false;
+                    if (m.pendingOut) {
+                        double first = haversine_m(aLat, aLon, m.pendingLat, m.pendingLon);
+                        double b1 = bearing_deg(aLat, aLon, m.pendingLat, m.pendingLon);
+                        double b2 = bearing_deg(aLat, aLon, lat, lon);
+                        double turn = std::fabs(b1 - b2);
+                        if (turn > 180.0) turn = 360.0 - turn;
+                        confirmed = turn < 70.0 && distAnchor + 20.0 >= first && distAnchor > 40.0;
+                    }
+                    if (!confirmed) {
+                        m.pendingOut = true;
+                        m.pendingLat = lat;
+                        m.pendingLon = lon;
+                        snap_anchor();
+                        recordHistory = false;
+                    } else {
+                        m.pendingOut = false;
+                        depart_locked(m, ts);
+                        m.lat = lat;
+                        m.lon = lon;
+                        m.anchorLat = lat;
+                        m.anchorLon = lon;
+                        apply_area_change_locked(m, lat, lon, ts);
+                        if (hasSpeed) m.speed = speed;
+                    }
                 }
                 m.ts = ts;
                 m.hasLoc = true;

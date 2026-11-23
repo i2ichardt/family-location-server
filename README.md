@@ -6,9 +6,9 @@ The Android app is [location-test](https://github.com/i2ichardt/location-test).
 
 ## Download
 
-The compiled server is [server 1.11](https://github.com/i2ichardt/family-location-server/releases/tag/v1.11).
+The compiled server is [server 1.12](https://github.com/i2ichardt/family-location-server/releases/tag/v1.12).
 
-[Download FamilyLocationServer-windows.zip](https://github.com/i2ichardt/family-location-server/releases/download/v1.11/FamilyLocationServer-windows.zip)
+[Download FamilyLocationServer-windows.zip](https://github.com/i2ichardt/family-location-server/releases/download/v1.12/FamilyLocationServer-windows.zip)
 
 ## Set it up
 

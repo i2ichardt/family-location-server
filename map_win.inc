@@ -936,7 +936,7 @@ static std::wstring stay_line(const Member& m) {
     bool aliveOn = g_aliveOn.load();
     int aliveSecs = g_aliveSecs.load();
     bool unreachable = aliveOn && m.seen > 0 && now > m.seen + static_cast<long long>(aliveSecs) + 25;
-    if (unreachable) return base + L" · Can't reach phone";
+    if (unreachable) return L"Lost Connection!";
     if (!aliveOn) {
         long long heard = m.seen > 0 ? m.seen : m.ts;
         bool missed = m.every > 0 && heard > 0 && now > heard + static_cast<long long>(m.every * 1.5) + 20;
@@ -1387,11 +1387,22 @@ static LRESULT CALLBACK roster_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 std::wstring who = widen(m.name.empty() ? m.userId : m.name);
                 g.DrawString(who.c_str(), -1, &body, nameRect, &clipText, &ink);
                 Gdiplus::RectF stayRect(68, static_cast<float>(y + 36), static_cast<float>(width - 84), 18);
-                g.DrawString(stay_line(m).c_str(), -1, &small, stayRect, &clipText, &muted);
+                if (unreachable) {
+                    Gdiplus::SolidBrush lostBrush(Gdiplus::Color(255, 200, 16, 46));
+                    g.DrawString(L"Lost Connection!", -1, &small, stayRect, &clipText, &lostBrush);
+                } else {
+                    g.DrawString(stay_line(m).c_str(), -1, &small, stayRect, &clipText, &muted);
+                }
                 std::wstring phone = m.phone.empty() ? L"" : widen(m.phone);
-                if (m.battery >= 0) {
+                if (unreachable && m.seen > 0) {
+                    long long heardMins = nowS > m.seen ? (nowS - m.seen) / 60 : 0;
+                    std::wstring heard = heardMins < 1 ? L"Last response just now" : L"Last response " + ago_phrase(heardMins);
+                    phone = phone.empty() ? heard : heard + L"   " + phone;
+                }
+                int shownBattery = unreachable ? 0 : m.battery;
+                if (shownBattery >= 0) {
                     if (!phone.empty()) phone += L"   ";
-                    phone += L"Battery " + std::to_wstring(m.battery) + L"%";
+                    phone += L"Battery " + std::to_wstring(shownBattery) + L"%";
                 }
                 if (m.signal >= 0) {
                     if (!phone.empty()) phone += L"   ";
